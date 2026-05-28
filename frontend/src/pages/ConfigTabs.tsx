@@ -617,6 +617,36 @@ MaxFileSize ${Math.ceil(inMB)}M`}
                                     }
                                     return null;
                                 })()}
+
+                                <div className="mt-4 p-3 bg-neutral-900/80 border border-neutral-700 rounded-lg">
+                                    <p className="text-white text-sm font-bold flex items-center gap-2">
+                                        <AlertTriangle className="w-4 h-4 text-neutral-400" /> Archive / zip-bomb protection (ClamAV)
+                                    </p>
+                                    <p className="text-neutral-400 text-xs mt-2">
+                                        When scanning archives, ClamAV unpacks them on the server. Set these limits on the ClamAV container
+                                        (in addition to StreamMaxLength above). Uploads are not blocked in production — scanning enforces safety.
+                                    </p>
+                                    <p className="text-neutral-400 text-xs mt-3 font-bold">clamd.conf (recommended)</p>
+                                    <pre className="mt-1 bg-black p-2 rounded text-xs text-green-400 font-mono overflow-x-auto">
+                                        {`MaxScanSize 100M
+MaxFileSize 50M
+MaxFiles 10000
+MaxRecursion 16
+MaxScanTime 120000`}
+                                    </pre>
+                                    <p className="text-neutral-400 text-xs mt-3 font-bold">Docker Compose (ClamAV service)</p>
+                                    <pre className="mt-1 bg-black p-2 rounded text-xs text-blue-400 font-mono overflow-x-auto">
+                                        {`environment:
+  - CLAMD_CONF_MaxScanSize=100M
+  - CLAMD_CONF_MaxFileSize=50M
+  - CLAMD_CONF_MaxFiles=10000
+  - CLAMD_CONF_MaxRecursion=16
+  - CLAMD_CONF_MaxScanTime=120000`}
+                                    </pre>
+                                    <p className="text-neutral-500 text-xs mt-2">
+                                        Also set memory/CPU limits on the clamav service. Restart ClamAV after changes.
+                                    </p>
+                                </div>
                             </div>
                         </div>
 
