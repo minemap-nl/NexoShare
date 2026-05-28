@@ -180,8 +180,6 @@ services:
       - ./clamav:/var/lib/clamav
 ```
 
-**Demo mode** (`DEMO_MODE=true`): loose archive uploads (`.zip`, `.rar`, …) are blocked at upload; Office files remain allowed. **Production**: archives are allowed; ClamAV limits above apply when scanning.
-
 4. Start the stack:
 
 ```sh
