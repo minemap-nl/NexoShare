@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "bun test src/tests/uploadPathPolicy.test.ts src/tests/nodemailerSmoke.test.ts",
+    "test": "bun test src/tests/uploadPathPolicy.test.ts src/tests/nodemailerSmoke.test.ts src/tests/blockedExtensions.test.ts src/tests/clamScan.test.ts src/tests/uploadValidation.test.ts",
     "test:integration": "bun test src/tests/integration.test.ts",
     "test:all": "bun test",
     "dev": "bun --watch src/index.ts",
@@ -39,7 +39,7 @@
     "glob": "^11.0.0",
     "brace-expansion": "^2.0.3",
     "@isaacs/brace-expansion": "^5.0.1",
-    "qs": "^6.14.2",
+    "qs": "6.15.2",
     "minimatch": "^10.2.3",
     "lodash": "^4.18.1",
     "path-to-regexp": "^8.4.0",

@@ -26,6 +26,20 @@ import {
 import validator from 'validator';
 import rateLimit from 'express-rate-limit';
 import { isPathUnderDir, isResolvedPathInsideDir, safeUploadBaseName } from './lib/uploadPathPolicy';
+import { buildDemoForceBlockedExtensions } from './lib/blockedExtensions';
+import {
+    isClamavScanEnforced as isClamavScanEnforcedForConfig,
+    scanPathWithClamav,
+    SCAN_MESSAGES_FINALIZE,
+    SCAN_MESSAGES_REVERSE,
+    SCAN_MESSAGES_STAGED,
+} from './lib/clamScan';
+import {
+    assertUploadFileNamesAllowed,
+    checkExtension,
+    getBlockedFilenameReason,
+    getUploadBlocklist,
+} from './lib/uploadValidation';
 
 dotenv.config();
 
@@ -43,15 +57,12 @@ const DEMO_MAX_FILE_MB = Math.max(1, Math.min(512, parseInt(String(process.env.D
 /** Demo: max local user rows (default 2: e.g. seed login + wizard-created admin). Set DEMO_MAX_USERS=1 for a single seeded account only. */
 const DEMO_MAX_USERS = Math.max(1, parseInt(String(process.env.DEMO_MAX_USERS || '2'), 10) || 2);
 
-/** Extensions always blocked for authenticated uploads in demo (same baseline as guest blocklist). */
-const DEMO_FORCE_BLOCKED_EXTENSIONS: readonly string[] = [
-    '.exe', '.bat', '.cmd', '.sh', '.ps1', '.vbs', '.php', '.php3', '.php4', '.phtml', '.pl', '.py', '.cgi',
-    '.jsp', '.asp', '.aspx', '.jar', '.msi', '.com', '.scr', '.hta', '.app', '.dmg', '.pkg'
-];
+/** Extensions always blocked in demo (executables + loose archives; not Office Open XML). */
+const DEMO_FORCE_BLOCKED_EXTENSIONS: readonly string[] = buildDemoForceBlockedExtensions();
 
 /** Fail-closed ClamAV behaviour: demo always enforces; otherwise follows "Enforce virus scan" in settings. */
 const isClamavScanEnforced = (config: { clamavMustScan?: boolean }) =>
-    DEMO_MODE || !!config.clamavMustScan;
+    isClamavScanEnforcedForConfig(config, DEMO_MODE);
 
 // Validation Schemas
 const reverseShareSchema = z.object({
@@ -643,12 +654,16 @@ function applyDemoSecurityPolicy(config: any): void {
     config.ssoAutoRedirect = false;
     config.smtpAllowLocal = false;
     config.allowPasswordReset = false;
-    const merged = new Set<string>();
-    for (const ext of DEMO_FORCE_BLOCKED_EXTENSIONS) merged.add(ext);
-    for (const ext of config.blockedExtensionsUser || []) {
-        if (typeof ext === 'string' && ext.length > 0) merged.add(ext.toLowerCase());
-    }
-    config.blockedExtensionsUser = Array.from(merged);
+    const mergeBlocked = (existing: string[] | undefined) => {
+        const merged = new Set<string>();
+        for (const ext of DEMO_FORCE_BLOCKED_EXTENSIONS) merged.add(ext);
+        for (const ext of existing || []) {
+            if (typeof ext === 'string' && ext.length > 0) merged.add(ext.toLowerCase());
+        }
+        return Array.from(merged);
+    };
+    config.blockedExtensionsUser = mergeBlocked(config.blockedExtensionsUser);
+    config.blockedExtensionsGuest = mergeBlocked(config.blockedExtensionsGuest);
 }
 
 // --- Security Helpers ---
@@ -686,6 +701,19 @@ const unlinkTempPartFilesForShare = async (shareId: string) => {
     try {
         const dir = await fs.readdir(TEMP_DIR);
         const prefix = `${shareId}_`;
+        for (const name of dir) {
+            if (name.startsWith(prefix) && name.endsWith('.part')) {
+                await safeUnlink(path.join(TEMP_DIR, name));
+            }
+        }
+    } catch { /* noop */ }
+};
+
+/** Verwijdert tijdelijke `rev_<reverseShareId>_*.part` bestanden in TEMP_DIR. */
+const unlinkTempPartFilesForReverseShare = async (reverseShareId: string) => {
+    try {
+        const dir = await fs.readdir(TEMP_DIR);
+        const prefix = `rev_${reverseShareId}_`;
         for (const name of dir) {
             if (name.startsWith(prefix) && name.endsWith('.part')) {
                 await safeUnlink(path.join(TEMP_DIR, name));
@@ -1279,76 +1307,17 @@ const handleUploadId: RequestHandler = async (req, res, next) => {
 
 // --- Virusscanner Helper ---
 const scanFiles = async (files: Express.Multer.File[]) => {
-    // 1. Haal de laatste config op
     const config = await getConfig();
-
-    // 2. Check of scanner beschikbaar is
-    if (!clamscanInstance) {
-        // Is de 'Verplicht Scannen' optie aangevinkt?
-        if (isClamavScanEnforced(config)) {
-            // FAIL-CLOSED: Scanner verplicht maar offline -> ERROR
-            console.error("⛔ Upload blocked: ClamAV is offline, but 'Enforce Virus Scan' is turned on.");
-            throw new Error("Security error: Virus scanner unavailable, upload refused.");
-        } else {
-            // FAIL-OPEN: Scanner niet verplicht -> Warning en doorgaan
-            console.warn("⚠️ Virusscan skipped: ClamAV is offline (not enforced).");
-            return;
-        }
-    }
-
-    // 3. Bereken max scan grootte in bytes
-    const sizeMultipliers: any = { 'KB': 1024, 'MB': 1024 * 1024, 'GB': 1024 * 1024 * 1024, 'TB': 1024 * 1024 * 1024 * 1024 };
-    const maxScanBytes = (config.maxScanSizeVal || 25) * (sizeMultipliers[config.maxScanSizeUnit] || sizeMultipliers['MB']);
-
-    // 4. Scanner is actief, voer scan uit
     for (const file of files) {
-        // Check bestandsgrootte tegen max scan limiet
-        if (file.size > maxScanBytes) {
-            const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
-            const limitMB = (maxScanBytes / (1024 * 1024)).toFixed(0);
-
-            if (isClamavScanEnforced(config)) {
-                // FAIL-CLOSED: Bestand te groot en scannen is verplicht
-                await safeUnlink(file.path);
-                throw new Error(
-                    `File "${file.originalname}" (${fileSizeMB} MB) exceeds the virus scan limit (${limitMB} MB). ` +
-                    `To scan larger files, increase 'Max Virus Scan File Size' in settings AND update ClamAV's StreamMaxLength in clamd.conf.`
-                );
-            } else {
-                // FAIL-OPEN: Log warning en sla scan over
-                console.warn(`⚠️ Skipping virus scan for "${file.originalname}" (${fileSizeMB} MB): exceeds limit of ${limitMB} MB.`);
-                continue;
-            }
-        }
-
-        try {
-            const result = await clamscanInstance.isInfected(file.path);
-            if (result.isInfected) {
-                await safeUnlink(file.path);
-                throw new Error(`Virus detected in ${file.originalname}! Upload refused.`);
-            }
-        } catch (e: any) {
-            // Als er een error is tijdens het scannen zelf (en het is geen virus melding)
-            if (e.message.includes('Virus')) throw e;
-            if (e.message.includes('exceeds')) throw e;  // Gooi size limit errors door
-
-            // Check specifiek voor ClamAV stream limit error
-            if (e.message.includes('INSTREAM size limit exceeded') || e.message.includes('StreamMaxLength')) {
-                const suggestedMB = Math.ceil(file.size / (1024 * 1024)) + 10;
-                throw new Error(
-                    `ClamAV rejected file "${file.originalname}": stream limit exceeded. ` +
-                    `Increase StreamMaxLength in clamd.conf to at least ${suggestedMB}M and restart ClamAV.`
-                );
-            }
-
-            // Ook hier: als scannen verplicht is, mag een error niet genegeerd worden
-            if (isClamavScanEnforced(config)) {
-                console.error(`Scan error (Closed): ${e.message}`);
-                throw new Error("Error during virusscan. Try again later.");
-            } else {
-                console.warn(`Scan error (Open): ${e.message}`);
-            }
-        }
+        await scanPathWithClamav({
+            filePath: file.path,
+            displayName: file.originalname,
+            fileSizeBytes: file.size,
+            config,
+            demoMode: DEMO_MODE,
+            clamscanInstance,
+            unlink: safeUnlink,
+        });
     }
 };
 
@@ -1377,7 +1346,21 @@ const storage = multer.diskStorage({
     }
 });
 const MAIN_UPLOAD_FILE_LIMIT = DEMO_MODE ? getBytes(DEMO_MAX_FILE_MB, 'MB') : 1024 * 1024 * 1024 * 1024;
-const upload = multer({ storage, limits: { fileSize: MAIN_UPLOAD_FILE_LIMIT } });
+const upload = multer({
+    storage,
+    limits: { fileSize: MAIN_UPLOAD_FILE_LIMIT },
+    fileFilter: (req, file, cb) => {
+        getConfig()
+            .then((config) => {
+                const blocklist = getUploadBlocklist(config, 'user');
+                if (blocklist.length > 0 && !checkExtension(file.originalname, blocklist)) {
+                    return cb(new Error('This file type is not allowed per configuration.'));
+                }
+                cb(null, true);
+            })
+            .catch((err) => cb(err));
+    },
+});
 
 // --- SYSTEM UPLOAD CONFIG ---
 const systemStorage = multer.diskStorage({
@@ -2350,6 +2333,12 @@ apiRouter.get('/config', async (req, res) => {
             ssoEnabled: config.ssoEnabled,
             ssoAutoRedirect: config.ssoAutoRedirect,
             ssoLogoutUrl: config.ssoLogoutUrl,
+            // Upload sizing (safe for guests/non-admin; used client-side for validation & chunking)
+            maxSizeVal: config.maxSizeVal,
+            maxSizeUnit: config.maxSizeUnit,
+            chunkSizeVal: config.chunkSizeVal,
+            chunkSizeUnit: config.chunkSizeUnit,
+            shareIdLength: config.shareIdLength,
             // Voeg deze regels toe zodat de login pagina weet wat mag:
             allowPasskeys: config.allowPasskeys,
             allowPasswordReset: config.allowPasswordReset,
@@ -2858,6 +2847,22 @@ apiRouter.post('/shares/init', authenticateToken, uploadLimiter, handleUploadId,
             return res.status(413).json({ error: 'Total upload exceeds maximum share size.' });
         }
 
+        const rawFileNames = (authReq.body as { fileNames?: unknown }).fileNames;
+        if (rawFileNames !== undefined && rawFileNames !== null) {
+            if (!Array.isArray(rawFileNames)) {
+                return res.status(400).json({ error: 'fileNames must be an array of strings' });
+            }
+            try {
+                assertUploadFileNamesAllowed(
+                    rawFileNames.map((n) => String(n)),
+                    config,
+                    'user'
+                );
+            } catch (e: any) {
+                return res.status(400).json({ error: e.message || 'File type not allowed' });
+            }
+        }
+
         let expiresAt = null;
 
         // 1. Definiëer unit (standaard uit config als niet meegegeven)
@@ -2931,56 +2936,33 @@ const chunkStorage = multer.diskStorage({
 });
 
 // 1. Authenticated Uploads (Alles toegestaan, want gebruiker is vertrouwd)
-// 1. Authenticated Uploads
-// --- Helper voor Extensie Checks ---
-const checkExtension = (filename: string, blocklist: string[]) => {
-    // 1. Basic Extension Check
-    const ext = path.extname(filename).toLowerCase();
-    if (blocklist.includes(ext)) return false;
-
-    // 2. Double Extension Check (e.g. image.php.jpg)
-    // Alleen checken als de voorlaatste extensie in de blacklist staat
-    const parts = filename.split('.');
-    if (parts.length > 2) {
-        const secondLast = '.' + parts[parts.length - 2].toLowerCase();
-        if (blocklist.includes(secondLast)) return false;
-    }
-    return true;
-};
-
 const CHUNK_BODY_LIMIT = DEMO_MODE ? getBytes(DEMO_MAX_FILE_MB, 'MB') : 500 * 1024 * 1024;
 
-// 1. Authenticated Uploads
+/** Reject blocked types using logical file name (req.body.fileName), not multer chunk field name. */
+async function rejectBlockedUploadFilename(
+    fileName: unknown,
+    audience: 'user' | 'guest',
+    res: Response,
+    tempChunkPath?: string
+): Promise<boolean> {
+    const config = await getConfig();
+    const blocklist = getUploadBlocklist(config, audience);
+    const safeName = typeof fileName === 'string' ? fileName : '';
+    const reason = getBlockedFilenameReason(safeName, blocklist);
+    if (!reason) return false;
+    if (tempChunkPath) await safeUnlink(tempChunkPath);
+    res.status(400).json({ error: reason });
+    return true;
+}
+
 const chunkUploadAuth = multer({
     storage: chunkStorage,
     limits: { fileSize: CHUNK_BODY_LIMIT, files: 1 },
-    fileFilter: (req, file, cb) => {
-        getConfig().then(config => {
-            const blocklist = config.blockedExtensionsUser || [];
-            if (blocklist.length > 0 && !checkExtension(file.originalname, blocklist)) {
-                return cb(new Error('This file type is not allowed per configuration.'));
-            }
-            cb(null, true);
-        }).catch(err => cb(err));
-    }
 });
 
-// 2. Public / Reverse Uploads
 const chunkUploadPublic = multer({
     storage: chunkStorage,
     limits: { fileSize: CHUNK_BODY_LIMIT, files: 1 },
-    fileFilter: (req, file, cb) => {
-        getConfig().then(config => {
-            // Default fallback als config leeg zou zijn (veiligheid)
-            const defaultGuestBlock = ['.exe', '.bat', '.cmd', '.sh', '.ps1', '.vbs', '.php', '.php3', '.php4', '.phtml', '.pl', '.py', '.cgi', '.jsp', '.asp', '.aspx', '.jar', '.msi', '.com', '.scr', '.hta', '.app', '.dmg', '.pkg'];
-            const blocklist = config.blockedExtensionsGuest || defaultGuestBlock;
-
-            if (!checkExtension(file.originalname, blocklist)) {
-                return cb(new Error('This file type is not allowed for security reasons.'));
-            }
-            cb(null, true);
-        }).catch(err => cb(err));
-    }
 });
 
 apiRouter.post('/shares/:id/chunk', authenticateToken, uploadLimiter, chunkUploadAuth.single('chunk'), async (req, res) => {
@@ -3001,7 +2983,12 @@ apiRouter.post('/shares/:id/chunk', authenticateToken, uploadLimiter, chunkUploa
 
     // UNIEKE NAAM: Opslaan als .part bestand (één bestand dat groeit)
     const safeFileName = safeUploadBaseName(fileName);
-    if (!safeFileName) return res.status(400).json({ error: 'Invalid file name' });
+    if (!safeFileName) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid file name' });
+    }
+    if (await rejectBlockedUploadFilename(fileName, 'user', res, req.file.path)) return;
+
     const partFilePath = path.join(TEMP_DIR, `${id}_${fileId}_${safeFileName}.part`);
     if (!isResolvedPathInsideDir(TEMP_DIR, partFilePath)) {
         await safeUnlink(req.file.path);
@@ -3150,6 +3137,17 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
 
     try {
         const config = await getConfig();
+        try {
+            assertUploadFileNamesAllowed(
+                files.map((f: { fileName?: string; originalName?: string }) => f.fileName || f.originalName || ''),
+                config,
+                'user'
+            );
+        } catch (extErr: any) {
+            await unlinkTempPartFilesForShare(id);
+            return res.status(400).json({ error: extErr.message || 'File type not allowed' });
+        }
+
         const shareDir = path.join(UPLOAD_DIR, id);
 
         const checkOwner = await client.query('SELECT user_id FROM shares WHERE id = $1', [id]);
@@ -3190,45 +3188,16 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
 
 
 
-            // VIRUSSCAN
-            const sizeMultipliers: any = { 'KB': 1024, 'MB': 1024 * 1024, 'GB': 1024 * 1024 * 1024, 'TB': 1024 * 1024 * 1024 * 1024 };
-            const maxScanBytes = (config.maxScanSizeVal || 25) * (sizeMultipliers[config.maxScanSizeUnit] || sizeMultipliers['MB']);
-
-            if (f.size > maxScanBytes) {
-                const fileSizeMB = (f.size / (1024 * 1024)).toFixed(1);
-                const limitMB = (maxScanBytes / (1024 * 1024)).toFixed(0);
-                if (isClamavScanEnforced(config)) {
-                    await safeUnlink(finalPath);
-                    throw new Error(
-                        `File "${f.originalName}" (${fileSizeMB} MB) exceeds virus scan limit (${limitMB} MB). ` +
-                        `Increase 'Max Virus Scan File Size' in settings AND ClamAV's StreamMaxLength in clamd.conf.`
-                    );
-                } else {
-                    console.warn(`⚠️ Skipping virus scan for "${f.originalName}" (${fileSizeMB} MB): exceeds limit of ${limitMB} MB.`);
-                }
-            } else if (clamscanInstance) {
-                try {
-                    const result = await clamscanInstance.isInfected(finalPath);
-                    if (result.isInfected) {
-                        await safeUnlink(finalPath);
-                        throw new Error(`Virus detected in ${f.originalName}!`);
-                    }
-                } catch (scanErr: any) {
-                    if (scanErr.message.includes('Virus')) throw scanErr;
-                    if (scanErr.message.includes('INSTREAM size limit exceeded')) {
-                        const suggestedMB = Math.ceil(f.size / (1024 * 1024)) + 10;
-                        throw new Error(
-                            `ClamAV rejected "${f.originalName}": stream limit exceeded. ` +
-                            `Increase StreamMaxLength in clamd.conf to at least ${suggestedMB}M.`
-                        );
-                    }
-                    if (isClamavScanEnforced(config)) throw new Error("Virus scan error. Try again later.");
-                    console.warn(`Scan error (Open): ${scanErr.message}`);
-                }
-            } else if (isClamavScanEnforced(config)) {
-                await safeUnlink(finalPath);
-                throw new Error("Virus scanner unavailable, upload refused.");
-            }
+            await scanPathWithClamav({
+                filePath: finalPath,
+                displayName: f.originalName,
+                fileSizeBytes: f.size,
+                config,
+                demoMode: DEMO_MODE,
+                clamscanInstance,
+                unlink: safeUnlink,
+                messages: SCAN_MESSAGES_FINALIZE,
+            });
 
             const safeOriginalName = sanitizeFilename(f.originalName);
             await client.query(`INSERT INTO files (share_id, filename, original_name, size, mime_type, storage_path) VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -3504,6 +3473,16 @@ apiRouter.post('/shares/:id/stage', authenticateToken, uploadLimiter, async (req
 
     try {
         const config = await getConfig();
+        try {
+            assertUploadFileNamesAllowed(
+                files.map((f: { fileName?: string }) => f.fileName || ''),
+                config,
+                'user'
+            );
+        } catch (extErr: any) {
+            await unlinkTempPartFilesForShare(id);
+            return res.status(400).json({ error: extErr.message || 'File type not allowed' });
+        }
 
         for (const f of files) {
             if (!isValidId(f.fileId)) {
@@ -3540,45 +3519,16 @@ apiRouter.post('/shares/:id/stage', authenticateToken, uploadLimiter, async (req
                 throw new Error(`Failed to stage "${f.fileName}": ${e.message || 'rename failed'}`);
             }
 
-            // SCAN
-            const sizeMultipliers: any = { 'KB': 1024, 'MB': 1024 * 1024, 'GB': 1024 * 1024 * 1024, 'TB': 1024 * 1024 * 1024 * 1024 };
-            const maxScanBytes = (config.maxScanSizeVal || 25) * (sizeMultipliers[config.maxScanSizeUnit] || sizeMultipliers['MB']);
-
-            if (f.size > maxScanBytes) {
-                const fileSizeMB = (f.size / (1024 * 1024)).toFixed(1);
-                const limitMB = (maxScanBytes / (1024 * 1024)).toFixed(0);
-                if (isClamavScanEnforced(config)) {
-                    await safeUnlink(finalPath);
-                    throw new Error(
-                        `File "${f.fileName}" (${fileSizeMB} MB) exceeds virus scan limit (${limitMB} MB). ` +
-                        `Increase 'Max Virus Scan File Size' in settings AND ClamAV's StreamMaxLength.`
-                    );
-                } else {
-                    console.warn(`⚠️ Skipping virus scan for "${f.fileName}" (${fileSizeMB} MB): exceeds limit of ${limitMB} MB.`);
-                }
-            } else if (clamscanInstance) {
-                try {
-                    const result = await clamscanInstance.isInfected(finalPath);
-                    if (result.isInfected) {
-                        await safeUnlink(finalPath);
-                        throw new Error(`Virus detected in ${f.fileName}!`);
-                    }
-                } catch (scanErr: any) {
-                    if (scanErr.message.includes('Virus')) throw scanErr;
-                    if (scanErr.message.includes('INSTREAM size limit exceeded')) {
-                        const suggestedMB = Math.ceil(f.size / (1024 * 1024)) + 10;
-                        throw new Error(
-                            `ClamAV rejected "${f.fileName}": stream limit exceeded. ` +
-                            `Increase StreamMaxLength in clamd.conf to at least ${suggestedMB}M.`
-                        );
-                    }
-                    if (isClamavScanEnforced(config)) throw new Error("Virus scan error. Try again later.");
-                    console.warn(`Scan error (Open): ${scanErr.message}`);
-                }
-            } else if (isClamavScanEnforced(config)) {
-                await safeUnlink(finalPath);
-                throw new Error("Virus scanner unavailable, upload refused.");
-            }
+            await scanPathWithClamav({
+                filePath: finalPath,
+                displayName: f.fileName,
+                fileSizeBytes: f.size,
+                config,
+                demoMode: DEMO_MODE,
+                clamscanInstance,
+                unlink: safeUnlink,
+                messages: SCAN_MESSAGES_STAGED,
+            });
 
             stagedFiles.push({
                 tempId: stagedName,
@@ -4485,6 +4435,23 @@ apiRouter.post('/public/reverse/:id/init', checkUploadLimits, uploadLimiter, asy
         } catch { return res.status(403).json({ error: 'Session invalid' }); }
     }
 
+    const rawFileNames = (req.body as { fileNames?: unknown })?.fileNames;
+    if (rawFileNames !== undefined && rawFileNames !== null) {
+        if (!Array.isArray(rawFileNames)) {
+            return res.status(400).json({ error: 'fileNames must be an array of strings' });
+        }
+        try {
+            const config = await getConfig();
+            assertUploadFileNamesAllowed(
+                rawFileNames.map((n) => String(n)),
+                config,
+                'guest'
+            );
+        } catch (e: any) {
+            return res.status(400).json({ error: e.message || 'File type not allowed' });
+        }
+    }
+
     res.json({ success: true, reverseShareId: id });
 });
 
@@ -4504,7 +4471,12 @@ apiRouter.post('/public/reverse/:id/chunk', checkUploadLimits, uploadLimiter, ch
 
     // UNIEKE NAAM: Opslaan als .part bestand (één bestand dat groeit)
     const safeFileName = safeUploadBaseName(fileName);
-    if (!safeFileName) return res.status(400).json({ error: 'Invalid file name' });
+    if (!safeFileName) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid file name' });
+    }
+    if (await rejectBlockedUploadFilename(fileName, 'guest', res, req.file.path)) return;
+
     const partFilePath = path.join(TEMP_DIR, `rev_${id}_${fileId}_${safeFileName}.part`);
     if (!isResolvedPathInsideDir(TEMP_DIR, partFilePath)) {
         await safeUnlink(req.file.path);
@@ -4679,6 +4651,17 @@ apiRouter.post('/public/reverse/:id/finalize', uploadLimiter, async (req, res) =
             throw new Error(`Upload exceeds the limit of ${formatBytes(share.max_size)}.`);
         }
 
+        try {
+            assertUploadFileNamesAllowed(
+                files.map((f: { fileName?: string; originalName?: string }) => f.fileName || f.originalName || ''),
+                config,
+                'guest'
+            );
+        } catch (extErr: any) {
+            await unlinkTempPartFilesForReverseShare(id);
+            return res.status(400).json({ error: extErr.message || 'File type not allowed' });
+        }
+
         await client.query('BEGIN');
 
         // 3. Verwerken van bestanden
@@ -4713,44 +4696,16 @@ apiRouter.post('/public/reverse/:id/finalize', uploadLimiter, async (req, res) =
                 throw new Error(`Upload failed processing ${f.originalName} (Part Missing)`);
             }
 
-            // Virusscan & Extensie check
-            const sizeMultipliers: any = { 'KB': 1024, 'MB': 1024 * 1024, 'GB': 1024 * 1024 * 1024, 'TB': 1024 * 1024 * 1024 * 1024 };
-            const maxScanBytes = (config.maxScanSizeVal || 25) * (sizeMultipliers[config.maxScanSizeUnit] || sizeMultipliers['MB']);
-
-            if (f.size > maxScanBytes) {
-                const fileSizeMB = (f.size / (1024 * 1024)).toFixed(1);
-                const limitMB = (maxScanBytes / (1024 * 1024)).toFixed(0);
-                if (isClamavScanEnforced(config)) {
-                    await safeUnlink(finalPath);
-                    throw new Error(
-                        `File "${f.originalName}" (${fileSizeMB} MB) exceeds virus scan limit (${limitMB} MB). ` +
-                        `Contact the administrator to increase the virus scan limit.`
-                    );
-                } else {
-                    console.warn(`⚠️ Skipping virus scan for "${f.originalName}" (${fileSizeMB} MB): exceeds limit of ${limitMB} MB.`);
-                }
-            } else if (clamscanInstance) {
-                try {
-                    const result = await clamscanInstance.isInfected(finalPath);
-                    if (result.isInfected) {
-                        await safeUnlink(finalPath);
-                        throw new Error(`Virus in ${f.originalName}!`);
-                    }
-                } catch (scanErr: any) {
-                    if (scanErr.message.includes('Virus')) throw scanErr;
-                    if (scanErr.message.includes('INSTREAM size limit exceeded')) {
-                        const suggestedMB = Math.ceil(f.size / (1024 * 1024)) + 10;
-                        throw new Error(
-                            `Virus scanner rejected file due to size limit. Please contact the administrator.`
-                        );
-                    }
-                    if (isClamavScanEnforced(config)) throw new Error("Virus scan error. Try again later.");
-                    console.warn(`Scan error (Open): ${scanErr.message}`);
-                }
-            } else if (isClamavScanEnforced(config)) {
-                await safeUnlink(finalPath);
-                throw new Error("Security error: Virus scanner is unavailable.");
-            }
+            await scanPathWithClamav({
+                filePath: finalPath,
+                displayName: f.originalName,
+                fileSizeBytes: f.size,
+                config,
+                demoMode: DEMO_MODE,
+                clamscanInstance,
+                unlink: safeUnlink,
+                messages: SCAN_MESSAGES_REVERSE,
+            });
 
             const dangerousTypes = ['.exe', '.bat', '.cmd', '.sh', '.php', '.pl', '.py', '.cgi', '.jar', '.msi', '.com', '.scr', '.hta'];
             if (dangerousTypes.includes(path.extname(safeOriginalName).toLowerCase())) {
@@ -5159,7 +5114,7 @@ async function initDB() {
                     console.log(`🚀 API on ${PORT}`);
                     if (DEMO_MODE) {
                         console.log(
-                            `📌 DEMO_MODE active — data TTL ~${DEMO_RETENTION_MINUTES} min, upload/scan cap ${DEMO_MAX_FILE_MB} MB (aligned), max users ${DEMO_MAX_USERS}, ClamAV enforced, SSO/password-reset off, risky extensions blocked for users. (User rows are not auto-deleted; use DB refresh or DEMO_MAX_USERS.)`
+                            `📌 DEMO_MODE active — data TTL ~${DEMO_RETENTION_MINUTES} min, upload/scan cap ${DEMO_MAX_FILE_MB} MB (aligned), max users ${DEMO_MAX_USERS}, ClamAV enforced, archive uploads blocked, SSO/password-reset off, risky extensions blocked. (User rows are not auto-deleted; use DB refresh or DEMO_MAX_USERS.)`
                         );
                     }
                 });

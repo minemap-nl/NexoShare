@@ -161,6 +161,15 @@ services:
     image: clamav/clamav:latest
     container_name: nexoshare_clamav
     restart: unless-stopped
+    environment:
+      # Align StreamMaxLength with Settings → Max Virus Scan File Size
+      - CLAMD_CONF_StreamMaxLength=25M
+      # Archive / zip-bomb limits (see also Settings → Security in the app)
+      - CLAMD_CONF_MaxScanSize=100M
+      - CLAMD_CONF_MaxFileSize=50M
+      - CLAMD_CONF_MaxFiles=10000
+      - CLAMD_CONF_MaxRecursion=16
+      - CLAMD_CONF_MaxScanTime=120000
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "3310"]
       interval: 30s
@@ -170,6 +179,8 @@ services:
     volumes:
       - ./clamav:/var/lib/clamav
 ```
+
+**Demo mode** (`DEMO_MODE=true`): loose archive uploads (`.zip`, `.rar`, …) are blocked at upload; Office files remain allowed. **Production**: archives are allowed; ClamAV limits above apply when scanning.
 
 4. Start the stack:
 

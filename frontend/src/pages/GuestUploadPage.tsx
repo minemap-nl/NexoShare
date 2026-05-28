@@ -122,11 +122,16 @@ export function GuestUploadPage() {
             const chunkSizeUnit = (cfg?.chunkSizeUnit as string) || 'MB';
             const CHUNK_SIZE = chunkSizeVal * (sizeMap[chunkSizeUnit] || sizeMap['MB']);
 
-            // Init call
-            const initRes = await axios.post(`${API_URL}/public/reverse/${id}/init`);
-            if (!initRes.data.success) throw new Error('Init failed');
-
             const uploadableFiles = files.filter(f => !f.isDirectory && f.file && !f.cancelled);
+            if (uploadableFiles.length === 0) {
+                notify('No files to upload', 'error');
+                return;
+            }
+
+            const initRes = await axios.post(`${API_URL}/public/reverse/${id}/init`, {
+                fileNames: uploadableFiles.map((item) => item.path || item.name),
+            });
+            if (!initRes.data.success) throw new Error('Init failed');
             const uploadedFilesMeta = [];
             const totalUploadSize = uploadableFiles.reduce((acc, f) => acc + f.size, 0);
             let uploadedBytes = 0;

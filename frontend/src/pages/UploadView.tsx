@@ -287,7 +287,11 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
 
             const k = 1024;
             const sizeMap: any = { 'KB': k, 'MB': k * k, 'GB': k * k * k, 'TB': k * k * k * k };
-            const maxBytes = (config.maxSizeVal || 10) * (sizeMap[config.maxSizeUnit] || sizeMap['MB']);
+            const rawMaxSizeVal = Number(config?.maxSizeVal ?? 10);
+            const maxSizeVal = Number.isFinite(rawMaxSizeVal) && rawMaxSizeVal > 0 ? rawMaxSizeVal : 10;
+            const fallbackMaxUnit = config?.demoMode ? 'MB' : 'GB';
+            const maxSizeUnit = String(config?.maxSizeUnit ?? fallbackMaxUnit);
+            const maxBytes = maxSizeVal * (sizeMap[maxSizeUnit] || sizeMap['GB']);
 
             const uploadableFiles = filesRef.current.filter(f => !f.isDirectory && f.file && !f.cancelled);
             const totalUploadSize = uploadableFiles.reduce((acc, item) => acc + item.size, 0);
@@ -298,14 +302,19 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
             }
 
             if (totalUploadSize > maxBytes) {
-                throw new Error(`Total size (${formatBytes(totalUploadSize)}) exceeds the limit of ${config.maxSizeVal} ${config.maxSizeUnit}.`);
+                throw new Error(`Total size (${formatBytes(totalUploadSize)}) exceeds the limit of ${maxSizeVal} ${maxSizeUnit}.`);
             }
 
-            const chunkSizeVal = config.chunkSizeVal || 20;
-            const chunkSizeUnit = config.chunkSizeUnit || 'MB';
+            const rawChunkSizeVal = Number(config?.chunkSizeVal ?? 20);
+            const chunkSizeVal = Number.isFinite(rawChunkSizeVal) && rawChunkSizeVal > 0 ? rawChunkSizeVal : 20;
+            const chunkSizeUnit = String(config?.chunkSizeUnit ?? 'MB');
             const CHUNK_SIZE = chunkSizeVal * (sizeMap[chunkSizeUnit] || sizeMap['MB']);
 
-            const initPayload = { ...optsNow, totalUploadBytes: totalUploadSize };
+            const initPayload = {
+                ...optsNow,
+                totalUploadBytes: totalUploadSize,
+                fileNames: uploadableFiles.map((item) => item.path || item.name),
+            };
             const initRes = await axios.post(`${API_URL}/shares/init`, initPayload);
 
             if (!initRes.data.success) throw new Error('Initialization failed');
