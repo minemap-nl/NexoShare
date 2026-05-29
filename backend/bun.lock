@@ -7,7 +7,7 @@
       "dependencies": {
         "@simplewebauthn/server": "^9.0.3",
         "archiver": "^7.0.1",
-        "axios": "^1.15.2",
+        "axios": "^1.16.1",
         "clamscan": "^2.4.0",
         "cors": "^2.8.5",
         "dotenv": "^17.2.3",
@@ -49,6 +49,7 @@
     "brace-expansion": "^2.0.3",
     "cross-spawn": "^7.0.6",
     "fast-xml-parser": "^5.3.8",
+    "follow-redirects": "^1.16.0",
     "glob": "^11.0.0",
     "lodash": "^4.18.1",
     "minimatch": "^10.2.3",
