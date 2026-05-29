@@ -7,7 +7,7 @@
       "dependencies": {
         "@simplewebauthn/browser": "^13.2.2",
         "@types/prismjs": "^1.26.5",
-        "axios": "^1.15.2",
+        "axios": "^1.16.1",
         "dompurify": "^3.4.0",
         "framer-motion": "^12.23.26",
         "jszip": "^3.10.1",
@@ -45,6 +45,7 @@
   },
   "overrides": {
     "@xmldom/xmldom": "^0.8.12",
+    "follow-redirects": "^1.16.0",
     "underscore": "^1.13.8",
   },
   "packages": {
