@@ -40,6 +40,7 @@ import {
     getBlockedFilenameReason,
     getUploadBlocklist,
 } from './lib/uploadValidation';
+import { buildContentSecurityPolicy, parseExtraConnectOriginsFromEnv } from './lib/cspPolicy';
 
 dotenv.config();
 
@@ -452,66 +453,35 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Chunk-Size', 'X-Preview-Stream', 'Accept']
 }));
 // --- SECURITY HEADERS MIDDLEWARE ---
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
     // 1. HSTS (HTTP Strict Transport Security)
-    // Forceer HTTPS in productie. Voorkomt downgrade attacks.
-    // We checken NODE_ENV of dat het verzoek secure is (via proxy).
     const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
     if (process.env.NODE_ENV === 'production' && isSecure) {
         res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
 
-    // 2. Anti-Clickjacking
-    // Voorkomt dat jouw site in een iframe op een andere site wordt geladen.
     res.setHeader('X-Frame-Options', 'DENY');
-
-    // 3. MIME-type sniffing preventie
-    // Zorgt dat browsers bestanden niet als een ander type interpreteren (bijv. plaatje als script).
     res.setHeader('X-Content-Type-Options', 'nosniff');
-
-    // 4. Referrer Policy
-    // 'strict-origin-when-cross-origin' is veilig voor privacy maar houdt analytics werkend.
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
 
-    // 5. Content Security Policy (CSP) - DE KRITISCHE BALANS
-    // Dit is het beleid dat bepaalt wat mag laden.
-    const cspDirectives = [
-        "default-src 'self'", // Standaard: alleen dingen van eigen domein laden
-
-        // SCRIPTS: Sta eigen scripts toe. 'unsafe-inline' is vaak nodig voor React/Vite in sommige setups.
-        // Als je heel strikt wilt zijn, haal je 'unsafe-inline' weg, maar test dan goed!
-
-        "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com https://cloudflareinsights.com",
-
-        // STYLES: 'unsafe-inline' is nodig voor veel CSS-in-JS libraries en inline styles in React.
-        "style-src 'self' 'unsafe-inline'",
-
-        // AFBEELDINGEN: 
-        // We staan 'data:' toe (base64) en 'blob:' (previews).
-        // We staan 'https:' toe zodat externe logo URL's (van klanten/config) ALTIJD werken.
-        "img-src 'self' data: blob: https:",
-
-        // CONNECT (API & Fetch):
-        // 'self' zorgt dat de frontend altijd met de eigen backend mag praten.
-        // SSO redirects gebeHours via navigatie, dus die vallen hier niet onder (dat breekt niet).
-
-        "connect-src 'self' https://cloudflareinsights.com https://static.cloudflareinsights.com",
-
-        // FONTS:
-        "font-src 'self' data:",
-
-        // OBJECTS: Blokkeer flash/java plugins volledig
-        "object-src 'none'",
-
-        // BASE: Voorkomt <base> tag hijacking
-        "base-uri 'self'",
-
-        // FORMS: Zorgt dat formulieren alleen naar eigen domein of veilige doelen mogen posten.
-        // SSO Logins via POST kunnen hier 'https:' nodig hebben, maar meestal is SSO een redirect (GET).
-        "form-action 'self' https:"
-    ];
-
-    res.setHeader('Content-Security-Policy', cspDirectives.join('; '));
+    try {
+        const config = await getConfig();
+        res.setHeader(
+            'Content-Security-Policy',
+            buildContentSecurityPolicy({
+                brandingUrls: [config.logoUrl, config.faviconUrl, config.ssoLogoutUrl],
+                oidcIssuer: config.ssoEnabled ? config.oidcIssuer : undefined,
+                extraConnectOrigins: parseExtraConnectOriginsFromEnv(process.env.CSP_EXTRA_CONNECT_ORIGINS),
+            })
+        );
+    } catch {
+        res.setHeader(
+            'Content-Security-Policy',
+            buildContentSecurityPolicy({
+                extraConnectOrigins: parseExtraConnectOriginsFromEnv(process.env.CSP_EXTRA_CONNECT_ORIGINS),
+            })
+        );
+    }
 
     next();
 });
@@ -824,6 +794,11 @@ if (DEMO_MODE) {
 // --- Global Cache Variables ---
 let configCache: any = null;
 let configCacheTime = 0;
+
+function invalidateConfigCache() {
+    configCache = null;
+    configCacheTime = 0;
+}
 
 async function getConfig() {
     // Return cache als deze jonger is dan 10 Seconds (10000ms)
@@ -2411,6 +2386,7 @@ apiRouter.post('/config/branding', uploadSystem.fields([{ name: 'logo', maxCount
         if (files.favicon && files.favicon[0]) currentConfig.faviconUrl = `/api/uploads/system/${files.favicon[0].filename}`;
 
         await pool.query('UPDATE config SET data = $1 WHERE id = 1', [currentConfig]);
+        invalidateConfigCache();
         res.json({ success: true, logoUrl: currentConfig.logoUrl, faviconUrl: currentConfig.faviconUrl });
     } catch (e: any) {
         console.error('Branding upload error:', e);
@@ -2424,11 +2400,14 @@ apiRouter.put('/config', async (req, res) => {
     const authReq = req as AuthRequest;
     const newConfig = authReq.body;
 
-    // Security: Validate Logo URL to prevent XSS
-    if (newConfig.logoUrl && typeof newConfig.logoUrl === 'string') {
-        const lower = newConfig.logoUrl.toLowerCase().trim();
-        if (lower.startsWith('javascript:') || lower.startsWith('vbscript:') || lower.startsWith('data:')) {
-            return res.status(400).json({ error: 'Invalid Logo URL' });
+    // Security: Validate branding URLs to prevent XSS
+    for (const field of ['logoUrl', 'faviconUrl'] as const) {
+        const value = newConfig[field];
+        if (value && typeof value === 'string') {
+            const lower = value.toLowerCase().trim();
+            if (lower.startsWith('javascript:') || lower.startsWith('vbscript:') || lower.startsWith('data:')) {
+                return res.status(400).json({ error: `Invalid ${field}` });
+            }
         }
     }
 
@@ -2464,8 +2443,7 @@ apiRouter.put('/config', async (req, res) => {
             [finalConfig, currentConfig.setupCompleted || false]
         );
 
-        configCache = null; // Cache invalidatie
-        configCacheTime = 0;
+        invalidateConfigCache();
         res.json({ success: true });
     } catch (e) {
         console.error(e);
@@ -2478,7 +2456,7 @@ apiRouter.post('/config/setup-complete', async (req, res) => {
     if (!await checkConfigPermission(req, res)) return;
     try {
         await pool.query('UPDATE config SET setup_completed = TRUE WHERE id = 1');
-        configCache = null;
+        invalidateConfigCache();
         res.json({ success: true });
     } catch (e: any) {
         console.error('Setup complete error:', e);

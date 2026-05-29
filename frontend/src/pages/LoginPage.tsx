@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Share2, Shield, Loader2, Copy, Check } from 'lucide-react';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { API_URL } from '../api/constants';
-import { isValidHttpUrl } from '../lib';
+import { isAllowedBrandingUrl } from '../lib';
 import { useAppConfig } from '../context/AppConfigContext';
 import { useUI } from '../context/UIContext';
 import { GlobalStyles } from '../components/layout/GlobalStyles';
@@ -204,7 +204,7 @@ export function LoginPage({ onLogin }: any) {
             <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_50%_120%,rgba(13,148,136,0.14),rgba(0,0,0,0))]" aria-hidden />
             <form onSubmit={twoFactorRequired ? handleVerify2FA : handleSubmit} className="bg-neutral-900 p-6 md:p-10 rounded-2xl w-full max-w-md border border-neutral-800 shadow-2xl relative z-10 anim-scale mb-8">
                 <div className="flex justify-center mb-8">
-                    {(config.logoUrl && isValidHttpUrl(config.logoUrl)) ? <img src={config.logoUrl} className="h-16" alt="Logo" /> : <img src="/logo.svg" className="h-16" alt="Logo" />}
+                    {(config.logoUrl && isAllowedBrandingUrl(config.logoUrl)) ? <img src={config.logoUrl} className="h-16" alt="Logo" /> : <img src="/logo.svg" className="h-16" alt="Logo" />}
                 </div>
                 <h1 className="heading-page mb-6 text-center leading-tight">
                     Welcome to 

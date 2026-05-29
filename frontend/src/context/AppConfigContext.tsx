@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { API_URL } from '../api/constants';
 import { CONFIG_CHANGED_EVENT } from '../lib';
+import { applyDocumentFavicon } from '../lib/brandingDocument';
 
 export type AppConfigContextType = {
     config: any;
@@ -45,15 +46,7 @@ export function AppConfigProvider({ children }: { children: React.ReactNode }) {
     }, [refreshConfig]);
 
     useEffect(() => {
-        const url = config?.faviconUrl;
-        if (!url || typeof url !== 'string') return;
-        let link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
-        if (!link) {
-            link = document.createElement('link');
-            link.rel = 'icon';
-            document.getElementsByTagName('head')[0].appendChild(link);
-        }
-        link.href = url;
+        applyDocumentFavicon(config?.faviconUrl);
     }, [config?.faviconUrl]);
 
     return (

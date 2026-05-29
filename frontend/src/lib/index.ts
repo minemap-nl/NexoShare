@@ -12,4 +12,4 @@ export { formatBytes, UNITS, getUnitLabel, getFutureDate } from './format';
 export { computeChunkHash, getBackoffDelay, generateUUID } from './uploadCrypto';
 export { sortFiles, synthesizeDirectoryItems } from './uploadTree';
 export { traverseFileTree, processHandle } from './uploadFs';
-export { isValidHttpUrl } from './security';
+export { isAllowedBrandingUrl, isValidHttpUrl } from './security';
