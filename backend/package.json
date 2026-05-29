@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "bun test src/tests/uploadPathPolicy.test.ts src/tests/nodemailerSmoke.test.ts src/tests/blockedExtensions.test.ts src/tests/clamScan.test.ts src/tests/uploadValidation.test.ts",
+    "test": "bun test src/tests/cspPolicy.test.ts src/tests/uploadPathPolicy.test.ts src/tests/nodemailerSmoke.test.ts src/tests/blockedExtensions.test.ts src/tests/clamScan.test.ts src/tests/uploadValidation.test.ts",
     "test:integration": "bun test src/tests/integration.test.ts",
     "test:all": "bun test",
     "dev": "bun --watch src/index.ts",

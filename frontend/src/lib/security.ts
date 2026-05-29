@@ -10,3 +10,14 @@ export function isValidHttpUrl(url?: string): boolean {
         return false;
     }
 }
+
+/**
+ * Branding URLs: absolute http(s) or same-origin paths (e.g. /api/uploads/system/logo.png).
+ */
+export function isAllowedBrandingUrl(url?: string): boolean {
+    if (!url || typeof url !== 'string') return false;
+    const trimmed = url.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith('/') && !trimmed.startsWith('//')) return true;
+    return isValidHttpUrl(trimmed);
+}

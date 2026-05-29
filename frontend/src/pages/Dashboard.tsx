@@ -6,7 +6,7 @@ import {
     Shield,
 } from 'lucide-react';
 import { API_URL } from '../api/constants';
-import { isValidHttpUrl } from '../lib';
+import { isAllowedBrandingUrl } from '../lib';
 import { useAppConfig } from '../context/AppConfigContext';
 import { useUI } from '../context/UIContext';
 import { useAuth } from '../hooks/useAuth';
@@ -145,7 +145,7 @@ export function Dashboard({ token, logout }: any) {
                     className={`flex gap-2 md:gap-3 items-center font-bold text-xl md:text-2xl tracking-tight text-white transition z-10 flex-1 justify-center sm:justify-start ${is2FALocked ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:opacity-80'}`}
                     onClick={() => !is2FALocked && goToUpload()}
                 >
-                    {(config.logoUrl && isValidHttpUrl(config.logoUrl)) ? (
+                    {(config.logoUrl && isAllowedBrandingUrl(config.logoUrl)) ? (
                         <img src={config.logoUrl} className="h-8 md:h-10 rounded" alt="Logo" />
                     ) : (
                         <img src="/logo.svg" className="h-8 md:h-10 shrink-0" alt="Logo" />
