@@ -66,17 +66,6 @@ Unlike many standard open-source solutions, Nexo Share focuses heavily on securi
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-### Built With
-
-* [React][react-url]
-* [TypeScript][typescript-url]
-* [Bun][bun-url]
-* [Express][express-url]
-* [PostgreSQL][postgresql-url]
-* [Docker][docker-url]
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
 ---
 
 ## Key Features
@@ -208,6 +197,17 @@ On first startup, database tables are created automatically. If no users exist, 
 * **Password:** `admin123`
 
 > ⚠️ **Important:** Log in immediately and change these credentials.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+### Built With
+
+* [React][react-url]
+* [TypeScript][typescript-url]
+* [Bun][bun-url]
+* [Express][express-url]
+* [PostgreSQL][postgresql-url]
+* [Docker][docker-url]
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
