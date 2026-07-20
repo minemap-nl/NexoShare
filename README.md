@@ -2,7 +2,7 @@
 
 <br />
 <div align="center">
-  <a href="https://nexoshare.famretera.nl">
+  <a href="https://nexoshare.nl">
     <img src="./frontend/public/logo.svg" alt="Nexo Share Logo" width="120" />
   </a>
 
@@ -12,7 +12,7 @@
     A powerful, self-hosted, and secure file-sharing platform.<br />
     Share large files securely with password protection, expiration dates, and 2FA support.
     <br /><br />
-    <a href="https://nexoshare.famretera.nl"><strong>View Demo & More Info »</strong></a>
+    <a href="https://nexoshare.nl"><strong>View Demo & More Info »</strong></a>
     <br /><br />
     <a href="https://github.com/minemap-nl/nexoshare/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
     &middot;
@@ -232,7 +232,7 @@ See the `LICENSE` file for details.
 ## Contact
 
 **Minemap / Famretera**  
-Website: https://nexoshare.famretera.nl
+Website: https://nexoshare.nl
 
 Project Repository: https://github.com/minemap-nl/nexoshare
 
