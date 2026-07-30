@@ -89,7 +89,7 @@ Unlike many standard open-source solutions, Nexo Share focuses heavily on securi
 * **🛡️ Advanced Security**
   * Two-Factor Authentication (TOTP)
   * Passkey support (Face ID, Touch ID, Windows Hello)
-  * ClamAV virus scanning (always on for reverse shares; optional for internal shares)
+  * ClamAV virus scanning integration
 * **🔑 SSO Support** — OpenID Connect (OIDC) with optional admin groups (authoritative when set; skipped when empty).
 * **⚙️ Admin Dashboard** — Manage users, global settings, SMTP configuration, and audit logs.
 
