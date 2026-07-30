@@ -116,10 +116,65 @@ export function ConfigTabs({ user, onRestartSetup }: { user: any, onRestartSetup
                 data.smtpPass = '';
                 data.oidcSecret = '';
 
+                const pendingRaw = sessionStorage.getItem('pendingSsoAdminGroupTest');
+                if (pendingRaw) {
+                    sessionStorage.removeItem('pendingSsoAdminGroupTest');
+                    try {
+                        const pending = JSON.parse(pendingRaw) as { ssoAdminGroups?: string[] };
+                        const groups = Array.isArray(pending.ssoAdminGroups)
+                            ? pending.ssoAdminGroups
+                            : data.ssoAdminGroups || [];
+                        data.ssoAdminGroups = groups;
+                        setConfig(data);
+                        setActiveTab('sso');
+                        // Re-run membership test after SSO resync completed
+                        window.setTimeout(() => {
+                            void (async () => {
+                                notify('Checking your SSO admin group membership…', 'info');
+                                try {
+                                    const res = await fetch(`${API_URL}/config/test-sso-admin-groups`, {
+                                        method: 'POST',
+                                        credentials: 'include',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ ssoAdminGroups: groups }),
+                                    });
+                                    const result = await res.json().catch(() => ({}));
+                                    if (!res.ok) {
+                                        notify(result.error || 'SSO group test failed', 'error');
+                                        return;
+                                    }
+                                    if (result.needsResync) {
+                                        notify(
+                                            'SSO groups still not available. Confirm the IdP returns a groups claim, then try again.',
+                                            'error'
+                                        );
+                                        return;
+                                    }
+                                    if (!result.configured) {
+                                        notify(result.message || 'Group policy inactive (empty list).', 'info');
+                                        return;
+                                    }
+                                    notify(
+                                        result.message || (result.matches ? 'You match an admin group.' : 'You would lose admin.'),
+                                        result.matches ? 'success' : 'error'
+                                    );
+                                } catch {
+                                    notify('Network error while testing SSO admin groups', 'error');
+                                }
+                            })();
+                        }, 0);
+                        return;
+                    } catch {
+                        /* fall through to normal config load */
+                    }
+                }
+
                 setConfig(data);
             });
         fetchUsers();
         fetchContacts();
+        // Load once on mount — do not depend on notify (it changes every toast and would wipe unsaved edits).
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const fetchUsers = async () => {
@@ -142,13 +197,51 @@ export function ConfigTabs({ user, onRestartSetup }: { user: any, onRestartSetup
         } catch (e) { console.error(e); }
     };
     const save = async () => {
-        const res = await fetch(`${API_URL}/config`, { method: 'PUT', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
-        if (res.ok) {
-            notify('Settings saved', 'success');
-            dispatchConfigChanged();
-        } else {
-            notify('Saving failed', 'error');
+        const persist = async () => {
+            const res = await fetch(`${API_URL}/config`, { method: 'PUT', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
+            if (res.ok) {
+                notify('Settings saved', 'success');
+                dispatchConfigChanged();
+            } else {
+                notify('Saving failed', 'error');
+            }
+        };
+
+        // SSO tab: warn SSO admins before saving groups that would demote them
+        if (activeTab === 'sso') {
+            const groups = Array.isArray(config.ssoAdminGroups) ? config.ssoAdminGroups : [];
+            if (groups.length > 0 && localStorage.getItem('sso_login') === 'true') {
+                try {
+                    const res = await fetch(`${API_URL}/config/test-sso-admin-groups`, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ssoAdminGroups: groups }),
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (res.ok && data.needsResync) {
+                        sessionStorage.setItem(
+                            'pendingSsoAdminGroupTest',
+                            JSON.stringify({ ssoAdminGroups: groups, resumeSave: true })
+                        );
+                        notify('Refreshing SSO session before saving admin groups…', 'info');
+                        window.location.href = `${API_URL}/auth/sso`;
+                        return;
+                    }
+                    if (res.ok && data.wouldRemainAdmin === false) {
+                        confirm(
+                            'Warning: none of these group names appear in your IdP groups (typo or a group you are not in — OIDC cannot tell them apart). After saving, your next SSO login will remove your admin rights. Keep a local admin account as fallback. Continue?',
+                            () => { void persist(); }
+                        );
+                        return;
+                    }
+                } catch {
+                    /* fall through to normal save if pre-check fails */
+                }
+            }
         }
+
+        await persist();
     };
     const testEmail = async () => {
         const targetEmail = user.email;
@@ -176,6 +269,43 @@ export function ConfigTabs({ user, onRestartSetup }: { user: any, onRestartSetup
             }
         } catch (e: any) {
             notify(`Network error while testing to ${targetEmail}`, 'error');
+        }
+    };
+    const testSsoAdminGroups = async (groupsOverride?: string[]) => {
+        const groups = groupsOverride ?? config.ssoAdminGroups ?? [];
+        notify('Checking your SSO admin group membership…', 'info');
+        try {
+            const res = await fetch(`${API_URL}/config/test-sso-admin-groups`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ssoAdminGroups: groups }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                notify(data.error || 'SSO group test failed', 'error');
+                return;
+            }
+            if (data.needsResync) {
+                // Old cookie session predates group sync — refresh via SSO once, then re-run this test.
+                sessionStorage.setItem(
+                    'pendingSsoAdminGroupTest',
+                    JSON.stringify({ ssoAdminGroups: groups })
+                );
+                notify('Refreshing SSO session to load your IdP groups…', 'info');
+                window.location.href = `${API_URL}/auth/sso`;
+                return;
+            }
+            if (!data.configured) {
+                notify(data.message || 'Group policy inactive (empty list).', 'info');
+                return;
+            }
+            notify(
+                data.message || (data.matches ? 'You match an admin group.' : 'You would lose admin.'),
+                data.matches ? 'success' : 'error'
+            );
+        } catch {
+            notify('Network error while testing SSO admin groups', 'error');
         }
     };
     const createUser = async () => { const res = await fetch(`${API_URL}/users`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newUser) }); if (res.ok) { setNewUser({ email: '', name: '', password: '', is_admin: false }); fetchUsers(); notify('User added', 'success'); } };
@@ -534,16 +664,38 @@ export function ConfigTabs({ user, onRestartSetup }: { user: any, onRestartSetup
                         <div className="space-y-4 bg-red-500/5 p-4 rounded-xl border border-red-500/20 mb-8">
                             <div className="flex items-start gap-3">
                                 <Checkbox
-                                    checked={!!(config.clamavMustScan || isDemo)}
-                                    onChange={e => setConfig({ ...config, clamavMustScan: e.target.checked })}
+                                    checked={!!(config.clamavScanInternalShares || isDemo)}
+                                    onChange={e => setConfig({ ...config, clamavScanInternalShares: e.target.checked })}
                                     className="mt-1"
                                 />
                                 <div>
-                                    <span className="text-white font-bold block cursor-pointer" onClick={() => setConfig({ ...config, clamavMustScan: !config.clamavMustScan })}>Enforce Virus Scan</span>
+                                    <span className="text-white font-bold block cursor-pointer" onClick={() => setConfig({ ...config, clamavScanInternalShares: !config.clamavScanInternalShares })}>Scan internal shares with ClamAV</span>
                                     <p className="text-neutral-400 text-sm mt-1">
-                                        If checked, uploads will be <strong>rejected</strong> if the ClamAV scanner is unreachable.
+                                        When enabled, outbound (internal) uploads are virus-scanned. <strong>Reverse shares are always scanned</strong>, regardless of this setting.
                                         <br />
-                                        <span className="text-xs text-neutral-500">Default (off): Uploads will continue, but will not be scanned if ClamAV is offline.</span>
+                                        <span className="text-xs text-neutral-500">Default (off): Internal shares skip ClamAV unless you enable this.</span>
+                                    </p>
+                                    {isDemo && (
+                                        <p className="text-xs text-cyan-400/90 mt-2">Demo: internal scanning is always enabled on the server.</p>
+                                    )}
+                                </div>
+                            </div>
+
+                            <div className="flex items-start gap-3 border-t border-red-500/20 pt-4">
+                                <Checkbox
+                                    checked={!!(config.clamavMustScan || isDemo)}
+                                    onChange={e => {
+                                        if (!config.clamavScanInternalShares && !isDemo) return;
+                                        setConfig({ ...config, clamavMustScan: e.target.checked });
+                                    }}
+                                    className={`mt-1 ${!config.clamavScanInternalShares && !isDemo ? 'opacity-40 pointer-events-none' : ''}`}
+                                />
+                                <div>
+                                    <span className="text-white font-bold block cursor-pointer" onClick={() => { if (config.clamavScanInternalShares || isDemo) setConfig({ ...config, clamavMustScan: !config.clamavMustScan }); }}>Reject internal uploads if scanner offline</span>
+                                    <p className="text-neutral-400 text-sm mt-1">
+                                        Only applies when internal scanning is enabled. If checked, internal uploads are <strong>rejected</strong> when ClamAV is unreachable.
+                                        <br />
+                                        <span className="text-xs text-neutral-500">Reverse shares always reject when the scanner is offline.</span>
                                     </p>
                                     {isDemo && (
                                         <p className="text-xs text-cyan-400/90 mt-2">
@@ -685,7 +837,7 @@ MaxScanTime 120000`}
                             <div>
                                 <label className="label-form flex items-center gap-2">
                                     Sender (From)
-                                    <Tooltip content="Enter a name and email, e.g. 'Nexo Share <noreply@nexoshare.com>' (brackets are important)">
+                                    <Tooltip content="Enter a name and email, e.g. 'Nexo Share <noreply@nexoshare.nl>' (brackets are important)">
                                         <HelpCircle className="w-4 h-4 text-neutral-500 cursor-help" />
                                     </Tooltip>
                                 </label>
@@ -800,6 +952,41 @@ MaxScanTime 120000`}
                                 onChange={e => setConfig({ ...config, ssoAutoRedirect: e.target.checked })}
                                 label="Auto-Redirect to SSO (Skip login)"
                             />
+                        </div>
+
+                        <div className="border-t border-neutral-800 pt-4 space-y-3">
+                            <label className="label-form">SSO groups with admin rights</label>
+                            <p className="text-neutral-400 text-sm">
+                                One group name per line (exact match with Authentik <code className="text-primary-300">groups</code> in userinfo).
+                                Empty = policy off. Non-empty = on every SSO login, members of any listed group become admin; everyone else loses admin.
+                                OIDC only reports <em>your</em> groups — it cannot verify whether a name exists in the IdP. A typo and a real group you are not in both look the same: use <strong>Test</strong> before saving.
+                            </p>
+                            <textarea
+                                className="input-field min-h-[100px] font-mono text-sm"
+                                placeholder="nexoshare-admins&#10;it-admins"
+                                value={Array.isArray(config.ssoAdminGroups) ? config.ssoAdminGroups.join('\n') : ''}
+                                onChange={e =>
+                                    setConfig({
+                                        ...config,
+                                        ssoAdminGroups: e.target.value
+                                            .split(/[\n,]+/)
+                                            .map((s: string) => s.trim())
+                                            .filter(Boolean),
+                                    })
+                                }
+                            />
+                            <div className="flex flex-wrap items-center gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => void testSsoAdminGroups()}
+                                    className="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-lg font-bold border border-neutral-700 transition btn-press flex items-center gap-2 text-sm"
+                                >
+                                    <Shield className="w-4 h-4" /> Test my group membership
+                                </button>
+                                <p className="text-neutral-500 text-xs max-w-md">
+                                    Compares the groups above with your IdP groups from SSO. If your session is older, a quick SSO refresh runs automatically.
+                                </p>
+                            </div>
                         </div>
 
                         <button onClick={save} className="bg-gradient-brand hover:brightness-90 text-white px-6 py-2 rounded-lg font-bold mt-4 transition btn-press">Save settings</button>

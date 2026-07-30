@@ -1,6 +1,23 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", system-ui, sans-serif;
+
+  --color-app: #09090b;
+  --color-app-surface: #18181b;
+  --color-app-elevated: #27272a;
+
+  --color-primary-200: #99f6e4;
+  --color-primary-300: #5eead4;
+  --color-primary-400: #2dd4bf;
+  --color-primary-500: #14b8a6;
+  --color-primary: #0d9488;
+  --color-primary-700: #0f766e;
+  --color-primary-800: #115e59;
+  --color-primary-950: #042f2e;
+
+  --shadow-glow-primary: 0 12px 40px -12px rgba(13, 148, 136, 0.35);
+}
 
 @layer base {
   html {

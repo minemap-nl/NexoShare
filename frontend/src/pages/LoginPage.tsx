@@ -19,7 +19,7 @@ export function LoginPage({ onLogin }: any) {
 
     const { notify } = useUI();
 
-    const DEMO_EMAIL = 'demo@nexoshare.com';
+    const DEMO_EMAIL = 'demo@nexoshare.nl';
     const DEMO_PASSWORD = 'demo';
 
     const copyDemoValue = (field: 'email' | 'password', value: string) => {

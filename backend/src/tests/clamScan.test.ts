@@ -5,6 +5,7 @@ import {
     isClamavScanEnforced,
     isClamavThreatSignature,
     scanPathWithClamav,
+    shouldScanInternalShare,
 } from '../lib/clamScan';
 
 describe('clamScan helpers', () => {
@@ -13,10 +14,17 @@ describe('clamScan helpers', () => {
         expect(getMaxScanBytes({ maxScanSizeVal: 1, maxScanSizeUnit: 'GB' })).toBe(1024 * 1024 * 1024);
     });
 
-    test('isClamavScanEnforced when demo or config flag', () => {
-        expect(isClamavScanEnforced({}, true)).toBe(true);
-        expect(isClamavScanEnforced({ clamavMustScan: true }, false)).toBe(true);
-        expect(isClamavScanEnforced({ clamavMustScan: false }, false)).toBe(false);
+    test('shouldScanInternalShare respects flag and demo', () => {
+        expect(shouldScanInternalShare({}, false)).toBe(false);
+        expect(shouldScanInternalShare({ clamavScanInternalShares: true }, false)).toBe(true);
+        expect(shouldScanInternalShare({}, true)).toBe(true);
+    });
+
+    test('isClamavScanEnforced by context', () => {
+        expect(isClamavScanEnforced({}, true, 'internal')).toBe(true);
+        expect(isClamavScanEnforced({ clamavScanInternalShares: true, clamavMustScan: true }, false, 'internal')).toBe(true);
+        expect(isClamavScanEnforced({ clamavScanInternalShares: true, clamavMustScan: false }, false, 'internal')).toBe(false);
+        expect(isClamavScanEnforced({ clamavMustScan: false }, false, 'reverse')).toBe(true);
     });
 
     test('isClamavThreatSignature detects zip-bomb heuristics', () => {
@@ -28,8 +36,25 @@ describe('clamScan helpers', () => {
 });
 
 describe('scanPathWithClamav', () => {
-    const config = { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavMustScan: true };
+    const config = { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavMustScan: true, clamavScanInternalShares: true };
     const noopUnlink = async () => {};
+
+    test('skips internal scan when internal toggle off', async () => {
+        const unlinked: string[] = [];
+        await scanPathWithClamav({
+            filePath: '/tmp/x',
+            displayName: 'a.txt',
+            fileSizeBytes: 100,
+            config: { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavScanInternalShares: false },
+            demoMode: false,
+            scanContext: 'internal',
+            clamscanInstance: {
+                isInfected: async () => ({ isInfected: true }),
+            },
+            unlink: async (p) => { unlinked.push(p); },
+        });
+        expect(unlinked).toEqual([]);
+    });
 
     test('rejects oversize file when enforced', async () => {
         const unlinked: string[] = [];
@@ -40,6 +65,7 @@ describe('scanPathWithClamav', () => {
                 fileSizeBytes: 30 * 1024 * 1024,
                 config,
                 demoMode: false,
+                scanContext: 'internal',
                 clamscanInstance: null,
                 unlink: async (p) => { unlinked.push(p); },
             })
@@ -55,6 +81,7 @@ describe('scanPathWithClamav', () => {
                 fileSizeBytes: 100,
                 config,
                 demoMode: false,
+                scanContext: 'reverse',
                 clamscanInstance: null,
                 unlink: noopUnlink,
             })
@@ -69,6 +96,7 @@ describe('scanPathWithClamav', () => {
                 fileSizeBytes: 100,
                 config,
                 demoMode: false,
+                scanContext: 'reverse',
                 clamscanInstance: {
                     isInfected: async () => ({ isInfected: true, viruses: ['Eicar-Signature'] }),
                 },
@@ -85,6 +113,7 @@ describe('scanPathWithClamav', () => {
                 fileSizeBytes: 100,
                 config,
                 demoMode: false,
+                scanContext: 'reverse',
                 clamscanInstance: {
                     isInfected: async () => ({
                         isInfected: false,
@@ -101,8 +130,9 @@ describe('scanPathWithClamav', () => {
             filePath: '/tmp/x',
             displayName: 'big.bin',
             fileSizeBytes: 30 * 1024 * 1024,
-            config: { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavMustScan: false },
+            config: { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavScanInternalShares: true, clamavMustScan: false },
             demoMode: false,
+            scanContext: 'internal',
             clamscanInstance: {
                 isInfected: async () => ({ isInfected: true }),
             },
@@ -115,8 +145,9 @@ describe('scanPathWithClamav', () => {
             filePath: '/tmp/x',
             displayName: 'ok.txt',
             fileSizeBytes: 100,
-            config: { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavMustScan: false },
+            config: { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavScanInternalShares: true, clamavMustScan: false },
             demoMode: false,
+            scanContext: 'internal',
             clamscanInstance: {
                 isInfected: async () => ({ isInfected: false, viruses: [] }),
             },

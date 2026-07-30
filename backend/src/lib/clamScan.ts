@@ -2,7 +2,10 @@ export type ScanConfig = {
     maxScanSizeVal?: number;
     maxScanSizeUnit?: string;
     clamavMustScan?: boolean;
+    clamavScanInternalShares?: boolean;
 };
+
+export type ScanContext = 'internal' | 'reverse';
 
 export type ScanMessageOverrides = {
     virusDetected?: (displayName: string) => string;
@@ -18,6 +21,7 @@ export type ScanPathParams = {
     fileSizeBytes: number;
     config: ScanConfig;
     demoMode: boolean;
+    scanContext: ScanContext;
     clamscanInstance: { isInfected: (path: string) => Promise<{ isInfected: boolean; viruses?: string[] }> } | null;
     unlink: (filePath: string) => Promise<void>;
     messages?: ScanMessageOverrides;
@@ -36,8 +40,24 @@ export function getMaxScanBytes(config: ScanConfig): number {
     return val * (SIZE_MULTIPLIERS[unit] ?? SIZE_MULTIPLIERS.MB);
 }
 
-export function isClamavScanEnforced(config: ScanConfig, demoMode: boolean): boolean {
-    return demoMode || !!config.clamavMustScan;
+export function shouldScanInternalShare(config: ScanConfig, demoMode: boolean): boolean {
+    return demoMode || !!config.clamavScanInternalShares;
+}
+
+export function shouldScanReverseShare(): boolean {
+    return true;
+}
+
+/** Whether uploads must pass ClamAV gates (offline / oversize / heuristics). Virus hits always reject when scanning runs. */
+export function isClamavScanEnforced(
+    config: ScanConfig,
+    demoMode: boolean,
+    scanContext: ScanContext = 'internal'
+): boolean {
+    if (demoMode) return true;
+    if (scanContext === 'reverse') return true;
+    if (!shouldScanInternalShare(config, demoMode)) return false;
+    return !!config.clamavMustScan;
 }
 
 /** ClamAV limit / zip-bomb heuristics that must reject uploads when scan is enforced. */
@@ -104,13 +124,18 @@ export async function scanPathWithClamav(params: ScanPathParams): Promise<void> 
         fileSizeBytes,
         config,
         demoMode,
+        scanContext,
         clamscanInstance,
         unlink,
         messages: messageOverrides,
     } = params;
 
+    if (scanContext === 'internal' && !shouldScanInternalShare(config, demoMode)) {
+        return;
+    }
+
     const messages = resolveMessages(messageOverrides);
-    const enforced = isClamavScanEnforced(config, demoMode);
+    const enforced = isClamavScanEnforced(config, demoMode, scanContext);
     const maxScanBytes = getMaxScanBytes(config);
 
     if (fileSizeBytes > maxScanBytes) {
@@ -128,7 +153,7 @@ export async function scanPathWithClamav(params: ScanPathParams): Promise<void> 
 
     if (!clamscanInstance) {
         if (enforced) {
-            console.error("⛔ Upload blocked: ClamAV is offline, but 'Enforce Virus Scan' is turned on.");
+            console.error("⛔ Upload blocked: ClamAV is offline, but virus scan is enforced.");
             await unlink(filePath);
             throw new Error(messages.scannerOffline());
         }

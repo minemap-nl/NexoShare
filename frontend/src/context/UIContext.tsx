@@ -16,18 +16,22 @@ export function UIProvider({ children }: { children: React.ReactNode }) {
     const [previewName, setPreviewName] = useState<string>('');
     const [previewType, setPreviewType] = useState<string | undefined>(undefined);
 
-    const notify = (message: string, type: ToastType = 'info') => {
-        const id = Date.now();
+    const removeToast = useCallback((id: number) => {
+        setToasts(prev => prev.filter(t => t.id !== id));
+    }, []);
+
+    const notify = useCallback((message: string, type: ToastType = 'info') => {
+        const id = Date.now() + Math.floor(Math.random() * 1000);
         setToasts(prev => [...prev, { id, message, type }]);
-        setTimeout(() => removeToast(id), 5000);
-    };
+        window.setTimeout(() => {
+            setToasts(prev => prev.filter(t => t.id !== id));
+        }, 6000);
+    }, []);
 
-    const removeToast = (id: number) => setToasts(prev => prev.filter(t => t.id !== id));
-
-    const confirm = (msg: string, onConfirm: () => void) => {
+    const confirm = useCallback((msg: string, onConfirm: () => void) => {
         setConfirmMessage(msg);
         setConfirmCallback(() => onConfirm);
-    };
+    }, []);
 
     const handleConfirm = () => {
         if (confirmCallback) confirmCallback();
@@ -47,27 +51,32 @@ export function UIProvider({ children }: { children: React.ReactNode }) {
         setPreviewType(undefined);
     }, []);
 
-    const cancelConfirm = () => {
+    const cancelConfirm = useCallback(() => {
         setConfirmMessage(null);
         setConfirmCallback(null);
-    };
+    }, []);
 
     useEscapeKey(cancelConfirm, !!confirmMessage);
 
     return (
         <UIContext.Provider value={{ notify, confirm, preview, isConfirming: !!confirmMessage, isPreviewing: !!previewFile }}>
             {children}
-            <div className="fixed bottom-4 right-4 z-[10003] flex flex-col gap-2">
+            <div className="pointer-events-none fixed bottom-4 right-4 z-[10003] flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-2">
                 {toasts.map(toast => (
-                    <div key={toast.id} className={`p-4 rounded-xl shadow-lg text-white font-medium flex items-center gap-3 anim-slide ${toast.type === 'error' ? 'bg-red-500' :
-                        toast.type === 'success' ? 'bg-green-500' :
-                            'bg-neutral-800 border border-neutral-700'
-                        }`}>
-                        {toast.type === 'error' ? <AlertTriangle className="w-5 h-5" /> :
-                            toast.type === 'success' ? <Check className="w-5 h-5" /> :
-                                <Info className="w-5 h-5 text-primary-300" />}
-                        {toast.message}
-                        <button type="button" onClick={() => removeToast(toast.id)} className="ml-2 hover:bg-black/20 p-1 rounded"><X className="w-3 h-3" /></button>
+                    <div
+                        key={toast.id}
+                        className={`pointer-events-auto flex items-start gap-3 rounded-xl p-4 text-sm font-medium text-white shadow-lg anim-slide ${toast.type === 'error' ? 'bg-red-500' :
+                            toast.type === 'success' ? 'bg-green-500' :
+                                'border border-neutral-700 bg-neutral-800'
+                            }`}
+                    >
+                        <span className="mt-0.5 shrink-0">
+                            {toast.type === 'error' ? <AlertTriangle className="h-5 w-5" /> :
+                                toast.type === 'success' ? <Check className="h-5 w-5" /> :
+                                    <Info className="h-5 w-5 text-primary-300" />}
+                        </span>
+                        <span className="min-w-0 flex-1 break-words leading-snug">{toast.message}</span>
+                        <button type="button" onClick={() => removeToast(toast.id)} className="ml-1 shrink-0 rounded p-1 hover:bg-black/20"><X className="h-3 w-3" /></button>
                     </div>
                 ))}
             </div>

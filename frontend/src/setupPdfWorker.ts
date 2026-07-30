@@ -15,7 +15,6 @@ import { WorkerMessageHandler } from 'pdfjs-dist/build/pdf.worker.min.mjs';
 import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 declare global {
-    // eslint-disable-next-line no-var
     var pdfjsWorker: { WorkerMessageHandler: unknown } | undefined;
 }
 

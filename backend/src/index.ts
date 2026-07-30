@@ -6,7 +6,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import cors from 'cors';
 import nodemailer from 'nodemailer';
-import archiver from 'archiver';
+import { ZipArchive } from 'archiver';
 import crypto from 'crypto';
 import { promises as fs, type Dirent } from 'fs';
 import path from 'path';
@@ -41,6 +41,20 @@ import {
     getUploadBlocklist,
 } from './lib/uploadValidation';
 import { buildContentSecurityPolicy, parseExtraConnectOriginsFromEnv } from './lib/cspPolicy';
+import {
+    extractOidcGroups,
+    resolveSsoAdminFromGroups,
+    userMatchesSsoAdminGroups,
+} from './lib/ssoGroups';
+import {
+    cleanupOrphanedShareZips,
+    computeManifest,
+    getShareZipsDir,
+    invalidatePrezip,
+    schedulePrezip,
+    tryStreamPrezip,
+    type PrezipType,
+} from './lib/sharePrezip';
 
 dotenv.config();
 
@@ -61,9 +75,10 @@ const DEMO_MAX_USERS = Math.max(1, parseInt(String(process.env.DEMO_MAX_USERS ||
 /** Extensions always blocked in demo (executables + loose archives; not Office Open XML). */
 const DEMO_FORCE_BLOCKED_EXTENSIONS: readonly string[] = buildDemoForceBlockedExtensions();
 
-/** Fail-closed ClamAV behaviour: demo always enforces; otherwise follows "Enforce virus scan" in settings. */
-const isClamavScanEnforced = (config: { clamavMustScan?: boolean }) =>
-    isClamavScanEnforcedForConfig(config, DEMO_MODE);
+/** Fail-closed ClamAV for API hints: true when internal or reverse scanning is enforced. */
+const isClamavScanEnforcedForApi = (config: { clamavMustScan?: boolean; clamavScanInternalShares?: boolean }) =>
+    isClamavScanEnforcedForConfig(config, DEMO_MODE, 'reverse')
+    || isClamavScanEnforcedForConfig(config, DEMO_MODE, 'internal');
 
 // Validation Schemas
 const reverseShareSchema = z.object({
@@ -124,10 +139,12 @@ const PORT = parseInt(process.env.PORT || '3001');
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './uploads');
 const TEMP_DIR = path.join(UPLOAD_DIR, 'temp');
 const SYSTEM_DIR = path.join(UPLOAD_DIR, 'system'); // Veilige map voor systeem assets
+const SHARE_ZIPS_DIR = getShareZipsDir(UPLOAD_DIR);
 
 // Zorg dat mappen bestaan
 fs.mkdir(TEMP_DIR, { recursive: true }).catch(() => { });
 fs.mkdir(SYSTEM_DIR, { recursive: true }).catch(() => { });
+fs.mkdir(SHARE_ZIPS_DIR, { recursive: true }).catch(() => { });
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET || JWT_SECRET === 'dev-secret-change-me') {
     console.error('❌ CRITICAL: JWT_SECRET must be set in environment variables!');
@@ -246,6 +263,7 @@ cron.schedule('0 * * * *', async () => {
 
         for (const row of res.rows) {
             const sharePath = path.join(UPLOAD_DIR, row.id);
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', row.id);
             // Verwijder fysieke map
             await fs.rm(sharePath, { recursive: true, force: true }).catch(() => { });
             console.log(`Expired share deleted from disk: ${row.id}`);
@@ -267,6 +285,7 @@ cron.schedule('0 * * * *', async () => {
         await cleanupOrphanedFolders();
         await cleanupOrphanedGuestFiles();
         await cleanupOrphanedShareFiles();
+        await cleanupOrphanedShareZips(pool, SHARE_ZIPS_DIR);
 
         console.log('✅ Opruiming voltooid.');
     } catch (e) {
@@ -287,7 +306,8 @@ const cleanupOrphanedFolders = async () => {
                 dirent.isDirectory() &&
                 dirent.name !== 'temp' &&
                 dirent.name !== 'guest_uploads' &&
-                dirent.name !== 'system'
+                dirent.name !== 'system' &&
+                dirent.name !== 'share_zips'
             )
             .map(dirent => dirent.name);
 
@@ -620,6 +640,7 @@ function applyDemoSecurityPolicy(config: any): void {
     config.maxSizeVal = DEMO_MAX_FILE_MB;
     config.maxSizeUnit = 'MB';
     config.clamavMustScan = true;
+    config.clamavScanInternalShares = true;
     config.ssoEnabled = false;
     config.ssoAutoRedirect = false;
     config.smtpAllowLocal = false;
@@ -830,6 +851,8 @@ async function getConfig() {
             allowPasskeys: true,
             allowPasswordReset: true,
             maxScanSizeVal: 25, maxScanSizeUnit: 'MB',  // ClamAV default StreamMaxLength
+            clamavScanInternalShares: false,
+            ssoAdminGroups: [] as string[],
             appLocale: process.env.APP_LOCALE || 'en-GB',
             serverTimezone: process.env.TZ || 'UTC'
         };
@@ -866,7 +889,7 @@ async function getConfig() {
                 maxExpirationUnit: 'Minutes',
                 /**
                  * No users: force incomplete setup. With users: follow DB `setup_completed` so a seeded
-                 * placeholder (e.g. admin@nexoshare.com) can still run the wizard while setup_completed is false.
+                 * placeholder (e.g. admin@nexoshare.nl) can still run the wizard while setup_completed is false.
                  */
                 setupCompleted: demoUserCount === 0 ? false : !!finalConfig.setupCompleted,
                 smtpHost: '',
@@ -894,6 +917,14 @@ const generateSecureId = async () => {
     const config = await getConfig();
     const len = Math.max(8, parseInt(config.shareIdLength) || 12);
     return crypto.randomBytes(Math.ceil(len / 2)).toString('hex').slice(0, len);
+};
+
+const triggerPrezip = async (type: PrezipType, id: string) => {
+    const cfg = await getConfig();
+    schedulePrezip(pool, SHARE_ZIPS_DIR, type, id, {
+        zipLevel: cfg.zipLevel,
+        zipNoMedia: cfg.zipNoMedia,
+    });
 };
 
 const escapeHtml = (unsafe: string | any) => {
@@ -1290,6 +1321,7 @@ const scanFiles = async (files: Express.Multer.File[]) => {
             fileSizeBytes: file.size,
             config,
             demoMode: DEMO_MODE,
+            scanContext: 'internal',
             clamscanInstance,
             unlink: safeUnlink,
         });
@@ -1685,7 +1717,7 @@ apiRouter.post('/passkeys/register/options', authenticateToken, async (req, res)
         const options = await generateRegistrationOptions({
             rpName: config.appName || 'Nexo Share',
             rpID: rpID, // Dynamisch!
-            userID: Buffer.from(user.rows[0].id.toString()).toString('base64url'),
+            userID: new TextEncoder().encode(String(user.rows[0].id)),
             userName: user.rows[0].email,
             userDisplayName: user.rows[0].name,
             attestationType: 'none',
@@ -1722,18 +1754,19 @@ apiRouter.post('/passkeys/register/verify', authenticateToken, async (req, res) 
             expectedChallenge,
             expectedOrigin: baseUrl, // Checkt: https://wetransfer.famretera.nl
             expectedRPID: rpID,      // Checkt: wetransfer.famretera.nl
+            requireUserVerification: false,
         });
 
         if (verification.verified && verification.registrationInfo) {
-            const { credentialID, credentialPublicKey, counter } = verification.registrationInfo;
+            const { credential } = verification.registrationInfo;
 
             await pool.query(
                 'INSERT INTO passkeys (user_id, credential_id, public_key, counter, name) VALUES ($1, $2, $3, $4, $5)',
                 [
                     authReq.user!.id,
-                    Buffer.from(credentialID).toString('base64'),
-                    Buffer.from(credentialPublicKey).toString('base64'),
-                    counter,
+                    Buffer.from(credential.id, 'base64url').toString('base64'),
+                    Buffer.from(credential.publicKey).toString('base64'),
+                    credential.counter,
                     name || 'Unnamed Passkey'
                 ]
             );
@@ -1838,9 +1871,10 @@ apiRouter.post('/passkeys/auth/verify', async (req, res) => {
             expectedChallenge,
             expectedOrigin: baseUrl, // Dynamisch
             expectedRPID: rpID,      // Dynamisch
-            authenticator: {
-                credentialID: Buffer.from(passkey.credential_id, 'base64'),
-                credentialPublicKey: Buffer.from(passkey.public_key, 'base64'),
+            requireUserVerification: false,
+            credential: {
+                id: Buffer.from(passkey.credential_id, 'base64').toString('base64url'),
+                publicKey: Buffer.from(passkey.public_key, 'base64'),
                 counter: parseInt(passkey.counter)
             }
         });
@@ -2081,7 +2115,7 @@ apiRouter.get('/auth/sso', async (req, res) => {
             }
             issuerOrigin = issuerUrl.origin;
         } catch (e) {
-            console.error('[SSO DEBUG] Invalid Issuer URL:', config.oidcIssuer);
+            console.error('[SSO] Invalid Issuer URL:', config.oidcIssuer);
             return res.status(500).send('Invalid SSO Configuration: Issuer URL must be a valid HTTP(S) URL');
         }
 
@@ -2090,7 +2124,8 @@ apiRouter.get('/auth/sso', async (req, res) => {
             client_id: config.oidcClientId,
             redirect_uri: redirectUri,
             response_type: 'code',
-            scope: 'openid profile email',
+            // `groups` is needed for Authentik / many IdPs to include group membership in userinfo
+            scope: 'openid profile email groups',
         });
 
         const targetUrl = `${issuerOrigin}/application/o/authorize/?${params.toString()}`;
@@ -2118,11 +2153,9 @@ apiRouter.get('/auth/sso', async (req, res) => {
             return res.status(500).send('Invalid Redirect URL: Target origin mismatch');
         }
 
-        console.log('[SSO DEBUG] Redirecting to:', targetUrl);
         res.redirect(targetUrl);
     } catch (e: any) {
-        console.error('[SSO DEBUG] Error:', e.message);
-        console.error('[SSO DEBUG] Error:', e.message);
+        console.error('[SSO] Init error:', e.message);
         res.status(500).type('text/plain').send('SSO Error: ' + e.message);
     }
 });
@@ -2152,7 +2185,6 @@ apiRouter.get('/auth/callback', async (req, res) => {
         try { issuerOrigin = new URL(config.oidcIssuer).origin; } catch (e) { }
 
         const redirectUri = `${cleanUrl(config.appUrl)}/api/auth/callback`;
-        console.log('[SSO DEBUG] Callback received.');
 
         const tokenParams = new URLSearchParams({
             grant_type: 'authorization_code',
@@ -2161,7 +2193,6 @@ apiRouter.get('/auth/callback', async (req, res) => {
             client_id: config.oidcClientId,
             client_secret: config.oidcSecret,
         });
-        console.log('[SSO DEBUG] Token Request Params:', tokenParams.toString());
 
         const tokenRes = await axios.post(`${issuerOrigin}/application/o/token/`, tokenParams, {
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
@@ -2180,20 +2211,54 @@ apiRouter.get('/auth/callback', async (req, res) => {
         let userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
         let user;
 
+        const oidcGroups = extractOidcGroups(userData as Record<string, unknown>);
+        const adminResolution = resolveSsoAdminFromGroups(
+            userData as Record<string, unknown>,
+            config.ssoAdminGroups
+        );
+
         if (userResult.rows.length === 0) {
-            console.log('[SSO DEBUG] Creating new user:', email);
-            const countRes = await pool.query('SELECT COUNT(*) FROM users');
-            const isAdmin = parseInt(countRes.rows[0].count) === 0;
             const dummyHash = await Bun.password.hash(crypto.randomBytes(16).toString('hex'));
+            // Groups configured + IdP returned groups → membership. Otherwise non-admin (never auto-admin via SSO).
+            const isAdmin = adminResolution.mode === 'enforce' ? adminResolution.isAdmin : false;
 
             const insertRes = await pool.query(
-                'INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4) RETURNING *',
-                [email, dummyHash, userData.name || userData.preferred_username || 'SSO User', isAdmin]
+                `INSERT INTO users (email, password_hash, name, is_admin, oidc_groups, oidc_groups_synced_at)
+                 VALUES ($1, $2, $3, $4, $5::jsonb, NOW()) RETURNING *`,
+                [
+                    email,
+                    dummyHash,
+                    userData.name || userData.preferred_username || 'SSO User',
+                    isAdmin,
+                    JSON.stringify(oidcGroups),
+                ]
             );
             user = insertRes.rows[0];
         } else {
             user = userResult.rows[0];
+            await pool.query(
+                `UPDATE users SET oidc_groups = $1::jsonb, oidc_groups_synced_at = NOW() WHERE id = $2`,
+                [JSON.stringify(oidcGroups), user.id]
+            );
+            user.oidc_groups = oidcGroups;
+            user.oidc_groups_synced_at = new Date();
+
+            if (adminResolution.mode === 'enforce') {
+                if (user.is_admin !== adminResolution.isAdmin) {
+                    await pool.query('UPDATE users SET is_admin = $1 WHERE id = $2', [
+                        adminResolution.isAdmin,
+                        user.id,
+                    ]);
+                    user.is_admin = adminResolution.isAdmin;
+                }
+            } else if (adminResolution.mode === 'claim_missing') {
+                console.warn(
+                    `[SSO] Admin groups are configured but IdP returned no groups for ${email}; leaving is_admin=${user.is_admin} unchanged`
+                );
+            }
+            // mode === 'skip': leave is_admin unchanged
         }
+        console.log(`[SSO] Groups synced for ${email}: ${oidcGroups.length} group(s)`);
 
         const token = jwt.sign(
             { id: user.id, email: user.email, isAdmin: user.is_admin },
@@ -2326,7 +2391,8 @@ apiRouter.get('/config', async (req, res) => {
         const authConfig = {
             ...publicConfig,
             clamavEnabled: !!clamscanInstance,
-            clamavMustScan: isClamavScanEnforced(config)
+            clamavMustScan: isClamavScanEnforcedForApi(config),
+            clamavScanInternalShares: !!config.clamavScanInternalShares || DEMO_MODE,
         };
 
         const cookies = parseCookies(req);
@@ -2342,7 +2408,8 @@ apiRouter.get('/config', async (req, res) => {
                     ...config,
                     demoMode: DEMO_MODE,
                     clamavEnabled: !!clamscanInstance,
-                    clamavMustScan: isClamavScanEnforced(config),
+                    clamavMustScan: isClamavScanEnforcedForApi(config),
+                    clamavScanInternalShares: !!config.clamavScanInternalShares || DEMO_MODE,
                     ...(DEMO_MODE ? { demoDataRetentionMinutes: DEMO_RETENTION_MINUTES, demoMaxFileMb: DEMO_MAX_FILE_MB } : {})
                 };
                 if (safeConfig.smtpPass) safeConfig.smtpPass = '********';
@@ -2519,6 +2586,102 @@ apiRouter.post('/config/test-email', async (req, res) => {
         const raw = String(e?.message || '');
         const isAuthFail = /535|authentication failed|invalid credentials|bad username or password|invalid login/i.test(raw);
         res.status(isAuthFail ? 401 : 502).json({ error: clientMsg });
+    }
+});
+
+/** Test whether the current admin would keep admin rights under proposed SSO admin groups. */
+apiRouter.post('/config/test-sso-admin-groups', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const authReq = req as AuthRequest;
+        const draftGroups = Array.isArray(req.body?.ssoAdminGroups)
+            ? req.body.ssoAdminGroups
+            : typeof req.body?.ssoAdminGroups === 'string'
+              ? req.body.ssoAdminGroups.split(/[\n,]+/)
+              : [];
+
+        const userRes = await pool.query(
+            'SELECT oidc_groups, oidc_groups_synced_at, is_admin, email FROM users WHERE id = $1',
+            [authReq.user!.id]
+        );
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const row = userRes.rows[0];
+        const synced = !!row.oidc_groups_synced_at;
+        let userGroups: string[] = [];
+        const raw = row.oidc_groups;
+        if (Array.isArray(raw)) {
+            userGroups = raw.map((g: unknown) => String(g).trim()).filter(Boolean);
+        } else if (typeof raw === 'string' && raw.trim()) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) {
+                    userGroups = parsed.map((g: unknown) => String(g).trim()).filter(Boolean);
+                }
+            } catch {
+                userGroups = [];
+            }
+        }
+
+        const result = userMatchesSsoAdminGroups(userGroups, draftGroups);
+
+        if (!result.configured) {
+            return res.json({
+                configured: false,
+                matches: true,
+                wouldRemainAdmin: true,
+                synced,
+                needsResync: false,
+                userGroups,
+                matchedGroups: [],
+                message:
+                    'No admin groups entered — group policy is off. Existing admin flags are left unchanged on SSO login.',
+            });
+        }
+
+        if (!synced) {
+            return res.json({
+                configured: true,
+                matches: false,
+                wouldRemainAdmin: false,
+                synced: false,
+                needsResync: true,
+                userGroups: [],
+                matchedGroups: [],
+                message: 'SSO group data is not synced for this session yet.',
+            });
+        }
+
+        if (userGroups.length === 0) {
+            return res.json({
+                configured: true,
+                matches: false,
+                wouldRemainAdmin: true,
+                synced: true,
+                needsResync: false,
+                userGroups: [],
+                matchedGroups: [],
+                message:
+                    'Your last SSO login returned no groups from the IdP. Admin flags stay unchanged when the groups claim is missing. Check the OIDC groups scope / claim mapping.',
+            });
+        }
+
+        return res.json({
+            configured: true,
+            matches: result.matches,
+            wouldRemainAdmin: result.matches,
+            synced: true,
+            needsResync: false,
+            userGroups,
+            matchedGroups: result.matchedGroups,
+            message: result.matches
+                ? `You match admin group(s): ${result.matchedGroups.join(', ')}. Safe to save — you keep admin on next SSO login.`
+                : `None of the listed names appear in your IdP groups (${userGroups.join(', ') || 'none'}). OIDC cannot tell typo from a real group you are not in — both demote you. If you save, your next SSO login removes admin rights.`,
+        });
+    } catch (e: any) {
+        console.error('test-sso-admin-groups error:', e);
+        res.status(500).json({ error: e.message || 'Test failed' });
     }
 });
 
@@ -3172,6 +3335,7 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
                 fileSizeBytes: f.size,
                 config,
                 demoMode: DEMO_MODE,
+                scanContext: 'internal',
                 clamscanInstance,
                 unlink: safeUnlink,
                 messages: SCAN_MESSAGES_FINALIZE,
@@ -3211,6 +3375,7 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
         }
 
         await logAudit(authReq.user!.id, 'share_created', 'share', id, req, { fileCount: files.length });
+        void triggerPrezip('share', id);
         res.json({
             success: true,
             shareUrl: `${config.appUrl || 'http://localhost:5173'}/s/${id}`,
@@ -3300,6 +3465,16 @@ apiRouter.put('/shares/:id', authenticateToken, uploadLimiter, checkUploadLimits
             values.push(date);
         }
 
+        if (authReq.body.maxDownloads !== undefined) {
+            const raw = authReq.body.maxDownloads;
+            const maxDl =
+                raw === '' || raw === null || raw === undefined
+                    ? null
+                    : parseInt(String(raw), 10);
+            updates.push(`max_downloads = $${i++}`);
+            values.push(maxDl != null && Number.isFinite(maxDl) && maxDl > 0 ? maxDl : null);
+        }
+
         await client.query('BEGIN');
 
         // Als het ID verandert, hernoem de map en update paden
@@ -3380,6 +3555,19 @@ apiRouter.put('/shares/:id', authenticateToken, uploadLimiter, checkUploadLimits
         }
 
         await client.query('COMMIT');
+
+        const filesAdded =
+            (authReq.files && (authReq.files as Express.Multer.File[]).length > 0) || stagedList.length > 0;
+        const metaChanged =
+            authReq.body.expirationVal !== undefined || authReq.body.maxDownloads !== undefined;
+        if (newId !== currentId) {
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', currentId);
+        }
+        if (filesAdded || metaChanged) {
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', newId);
+            void triggerPrezip('share', newId);
+        }
+
         res.json({ success: true, newId });
     } catch (e: any) {
         await client.query('ROLLBACK');
@@ -3503,6 +3691,7 @@ apiRouter.post('/shares/:id/stage', authenticateToken, uploadLimiter, async (req
                 fileSizeBytes: f.size,
                 config,
                 demoMode: DEMO_MODE,
+                scanContext: 'internal',
                 clamscanInstance,
                 unlink: safeUnlink,
                 messages: SCAN_MESSAGES_STAGED,
@@ -3604,9 +3793,13 @@ apiRouter.get('/shares/:id/download', downloadLimiter, async (req, res) => {
             const updateRes = await pool.query(
                 `UPDATE shares SET download_count = download_count + 1 
                  WHERE id = $1 AND (max_downloads IS NULL OR download_count < max_downloads)
-                 RETURNING download_count`, [id]
+                 RETURNING download_count, max_downloads`, [id]
             );
             if (updateRes.rows.length === 0) { release(); return res.status(410).end(); }
+            const row = updateRes.rows[0];
+            if (row.max_downloads != null && row.download_count >= row.max_downloads) {
+                await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
+            }
             res.cookie(dlCookieName, '1', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' || config.secureCookies });
         } else {
             if (share.max_downloads && share.download_count >= share.max_downloads) {
@@ -3614,15 +3807,29 @@ apiRouter.get('/shares/:id/download', downloadLimiter, async (req, res) => {
             }
         }
 
-        // 6. ZIP Genereren
-        // 6. ZIP Genereren
         const files = (await pool.query('SELECT * FROM files WHERE share_id = $1', [id])).rows;
         if (files.length === 0) { release(); return res.status(404).send('Empty'); }
+
+        const manifest = computeManifest(files);
+        const streamed = await tryStreamPrezip(
+            res,
+            pool,
+            SHARE_ZIPS_DIR,
+            'share',
+            id,
+            manifest,
+            `${id}.zip`
+        );
+        if (streamed) {
+            const totalSize = files.reduce((acc: number, f: any) => acc + parseInt(f.size), 0);
+            await logAudit(null, 'download_zip', 'share', id, req, { size: totalSize, prezip: true });
+            return;
+        }
 
         const totalSize = files.reduce((acc: number, f: any) => acc + parseInt(f.size), 0);
         const useCompression = totalSize < 100 * 1024 * 1024;
 
-        const archive = archiver('zip', {
+        const archive = new ZipArchive({
             zlib: { level: useCompression ? (config.zipLevel || 5) : 0 },
             store: !useCompression
         });
@@ -3644,7 +3851,7 @@ apiRouter.get('/shares/:id/download', downloadLimiter, async (req, res) => {
                 entryName = `${base} (${counter})${ext}`;
             }
             usedNames.add(entryName);
-            archive.file(f.storage_path, { name: entryName, store: shouldStore } as archiver.EntryData);
+            archive.file(f.storage_path, { name: entryName, store: shouldStore } as Parameters<ZipArchive['file']>[1]);
         });
 
         await logAudit(null, 'download_zip', 'share', id, req, { size: totalSize });
@@ -3664,6 +3871,7 @@ apiRouter.delete('/shares/:id', authenticateToken, uploadLimiter, async (req, re
     if (share.rows.length > 0) {
         clearUploadSessionKeys(authReq.params.id);
         await unlinkTempPartFilesForShare(authReq.params.id);
+        await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', authReq.params.id);
         // EERST proberen bestanden te verwijderen
         try {
             await fs.rm(path.join(UPLOAD_DIR, authReq.params.id), { recursive: true, force: true });
@@ -3704,6 +3912,7 @@ apiRouter.delete('/shares/:id/files/:fileId', authenticateToken, uploadLimiter, 
                 await fs.rm(path.join(UPLOAD_DIR, id), { recursive: true, force: true });
             } catch (e) { }
 
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
             await pool.query('DELETE FROM shares WHERE id = $1', [id]);
             await logAudit(authReq.user!.id, 'share_deleted_empty', 'share', id, req, { reason: 'last_file_deleted' });
 
@@ -3768,11 +3977,14 @@ apiRouter.delete('/shares/:id/folder', authenticateToken, uploadLimiter, async (
                 await fs.rm(path.join(UPLOAD_DIR, id), { recursive: true, force: true });
             } catch (e) { }
 
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
             await pool.query('DELETE FROM shares WHERE id = $1', [id]);
             await logAudit(authReq.user!.id, 'share_deleted_empty', 'share', id, req, { reason: 'folder_deleted_empty' });
             return res.json({ success: true, shareDeleted: true });
         }
 
+        await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
+        void triggerPrezip('share', id);
         await logAudit(authReq.user!.id, 'folder_deleted', 'share', id, req, { folder: folderPath, fileCount: fileRes.rows.length });
         res.json({ success: true, shareDeleted: false });
 
@@ -3825,7 +4037,13 @@ apiRouter.post('/reverse', authenticateToken, async (req, res) => {
         const baseUrl = getBaseUrl(config, req);
         const link = `${baseUrl}/r/${id}`;
         if (sendEmailTo) { await sendEmail(sendEmailTo, 'Upload Request', `<strong>${escapeHtml(authReq.user!.email)}</strong> invited you to upload files.`, link, 'Upload Files'); }
-        res.json({ success: true, url: link });
+        res.json({
+            success: true,
+            url: link,
+            name: finalName,
+            expiresAt: expiresAt ? expiresAt.toISOString() : null,
+            thankYouMessage: thankYouMessage || null,
+        });
     } catch (e: any) {
         if (e instanceof z.ZodError) {
             return res.status(400).json({ error: e.issues[0].message });
@@ -3844,6 +4062,7 @@ apiRouter.get('/reverse', authenticateToken, async (req, res) => {
 
 apiRouter.delete('/reverse/:id', authenticateToken, async (req, res) => {
     const authReq = req as AuthRequest;
+    await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'reverse', authReq.params.id);
     await pool.query('DELETE FROM reverse_shares WHERE id = $1 AND user_id = $2', [authReq.params.id, authReq.user!.id]);
     res.json({ success: true });
 });
@@ -3888,7 +4107,7 @@ apiRouter.all('/reverse/files/:fileId/download', authenticateToken, downloadLimi
     // Force dangerous shortcut files to be zipped to prevent browser renaming (.download)
     const ext = path.extname(file.original_name).toLowerCase();
     if (ext === '.lnk' || ext === '.url') {
-        const archive = archiver('zip', { zlib: { level: 9 } });
+        const archive = new ZipArchive({ zlib: { level: 9 } });
         res.setHeader('Content-Type', 'application/zip');
         res.attachment(`${file.original_name}.zip`);
         archive.pipe(res);
@@ -3956,9 +4175,25 @@ apiRouter.get('/reverse/:id/download', authenticateToken, downloadLimiter, async
         const files = await pool.query('SELECT * FROM files WHERE reverse_share_id = $1', [req.params.id]);
         if (files.rows.length === 0) return res.status(404).send('No files');
 
-        // ZIP maken
         const config = await getConfig();
-        const archive = archiver('zip', { zlib: { level: config.zipLevel || 5 } });
+        const manifest = computeManifest(files.rows);
+        const streamed = await tryStreamPrezip(
+            res,
+            pool,
+            SHARE_ZIPS_DIR,
+            'reverse',
+            req.params.id,
+            manifest,
+            `reverse_share_${req.params.id}.zip`
+        );
+        if (streamed) {
+            await logAudit(authReq.user!.id, 'reverse_download_zip', 'reverse_share', req.params.id, req, {
+                prezip: true,
+            });
+            return;
+        }
+
+        const archive = new ZipArchive({ zlib: { level: config.zipLevel || 5 } });
 
         res.attachment(`reverse_share_${req.params.id}.zip`);
         archive.pipe(res);
@@ -4131,7 +4366,7 @@ const shareFileHandler = async (req: any, res: any) => {
     // Stap 3: Bestand sturen (Force zip for shortcuts)
     const ext = path.extname(data.original_name).toLowerCase();
     if (ext === '.lnk' || ext === '.url') {
-        const archive = archiver('zip', { zlib: { level: 9 } });
+        const archive = new ZipArchive({ zlib: { level: 9 } });
         res.setHeader('Content-Type', 'application/zip');
         res.attachment(`${data.original_name}.zip`);
         archive.pipe(res);
@@ -4680,6 +4915,7 @@ apiRouter.post('/public/reverse/:id/finalize', uploadLimiter, async (req, res) =
                 fileSizeBytes: f.size,
                 config,
                 demoMode: DEMO_MODE,
+                scanContext: 'reverse',
                 clamscanInstance,
                 unlink: safeUnlink,
                 messages: SCAN_MESSAGES_REVERSE,
@@ -4699,6 +4935,8 @@ apiRouter.post('/public/reverse/:id/finalize', uploadLimiter, async (req, res) =
         }
 
         await client.query('COMMIT');
+
+        void invalidatePrezip(pool, SHARE_ZIPS_DIR, 'reverse', id).then(() => triggerPrezip('reverse', id));
 
         // Notificatie Email
         if (share.notify_email) {
@@ -4752,6 +4990,7 @@ async function runCLI() {
             console.log('\nConfiguration (Bulk Helpers):');
             console.log('  config-smtp <host> <port> <user> <pass> <from> <secure?> - Set all SMTP settings');
             console.log('  config-sso <issuer> <client_id> <secret>                 - Set OIDC settings');
+            console.log('  config-sso-admin-groups <g1> [g2...]                     - SSO groups that grant admin (empty = skip policy)');
             console.log('  security-toggle <feature> <true/false>                   - Features: 2fa, passkeys, reset');
 
             console.log('\nSystem:');
@@ -4799,6 +5038,17 @@ async function runCLI() {
             if (v === 'true') v = true;
             else if (v === 'false') v = false;
             // Alleen naar nummer converteren als het geen wachtwoord/secret/host is
+            else if (params[0] === 'ssoAdminGroups' && params[1].startsWith('[')) {
+                try {
+                    v = JSON.parse(params[1]);
+                } catch {
+                    console.log('Invalid JSON for ssoAdminGroups');
+                    return;
+                }
+            }
+            else if (params[0] === 'ssoAdminGroups') {
+                v = params.slice(1).join(' ').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+            }
             else if (!isNaN(Number(v)) && !['smtpPass', 'oidcSecret', 'smtpUser', 'smtpHost', 'appName'].includes(params[0])) {
                 v = Number(v);
             }
@@ -4847,6 +5097,13 @@ async function runCLI() {
             c.oidcSecret = params[2];
             await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
             console.log('✅ SSO configuration updated & enabled.');
+        }
+        else if (command === 'config-sso-admin-groups') {
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+            c.ssoAdminGroups = params.filter(Boolean);
+            await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
+            console.log('✅ SSO admin groups:', c.ssoAdminGroups);
         }
         else if (command === 'security-toggle') {
             const feature = params[0];
@@ -4994,6 +5251,14 @@ async function initDB() {
                     `ALTER TABLE config ADD COLUMN IF NOT EXISTS smtp_allow_local BOOLEAN DEFAULT FALSE`,
                     `ALTER TABLE config ADD COLUMN IF NOT EXISTS clamav_must_scan BOOLEAN DEFAULT FALSE`,
                     `ALTER TABLE config ADD COLUMN IF NOT EXISTS trust_proxy BOOLEAN DEFAULT FALSE`,
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS prezip_status VARCHAR(20)`,
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS prezip_manifest VARCHAR(64)`,
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS prezip_size BIGINT`,
+                    `ALTER TABLE reverse_shares ADD COLUMN IF NOT EXISTS prezip_status VARCHAR(20)`,
+                    `ALTER TABLE reverse_shares ADD COLUMN IF NOT EXISTS prezip_manifest VARCHAR(64)`,
+                    `ALTER TABLE reverse_shares ADD COLUMN IF NOT EXISTS prezip_size BIGINT`,
+                    `ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_groups JSONB`,
+                    `ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_groups_synced_at TIMESTAMPTZ`,
                 ];
 
                 for (const fix of schemaFixes) {
@@ -5005,6 +5270,27 @@ async function initDB() {
                     }
                 }
 
+                try {
+                    const cfgRow = await client.query('SELECT data FROM config WHERE id = 1');
+                    const cfgData = cfgRow.rows[0]?.data;
+                    if (cfgData && typeof cfgData === 'object') {
+                        let changed = false;
+                        if (cfgData.clamavMustScan === true && cfgData.clamavScanInternalShares === undefined) {
+                            cfgData.clamavScanInternalShares = true;
+                            changed = true;
+                        }
+                        if (!Array.isArray(cfgData.ssoAdminGroups)) {
+                            cfgData.ssoAdminGroups = [];
+                            changed = true;
+                        }
+                        if (changed) {
+                            await client.query('UPDATE config SET data = $1 WHERE id = 1', [cfgData]);
+                        }
+                    }
+                } catch (cfgMigrErr: any) {
+                    console.warn(`⚠️ Config JSON migration warning: ${cfgMigrErr.message}`);
+                }
+
                 // 1c. Admin Check & Setup
                 const adminCheck = await client.query('SELECT COUNT(*) FROM users');
                 if (adminCheck.rows && adminCheck.rows.length > 0) {
@@ -5013,20 +5299,20 @@ async function initDB() {
                         if (parseInt(adminCheck.rows[0].count) === 0) {
                             await client.query(
                                 `INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4)`,
-                                ['demo@nexoshare.com', demoHash, 'Demo Admin', true]
+                                ['demo@nexoshare.nl', demoHash, 'Demo Admin', true]
                             );
-                            console.log('✅ [DEMO] Demo user created: demo@nexoshare.com / demo');
+                            console.log('✅ [DEMO] Demo user created: demo@nexoshare.nl / demo');
                         } else {
                             await client.query(
-                                `UPDATE users SET password_hash = $1, email = 'demo@nexoshare.com' WHERE id = 1`,
+                                `UPDATE users SET password_hash = $1, email = 'demo@nexoshare.nl' WHERE id = 1`,
                                 [demoHash]
                             );
-                            console.log('✅ [DEMO] User id 1 password reset to "demo" (demo@nexoshare.com).');
+                            console.log('✅ [DEMO] User id 1 password reset to "demo" (demo@nexoshare.nl).');
                         }
                     } else if (parseInt(adminCheck.rows[0].count) === 0) {
                         const hash = await Bun.password.hash('admin123');
-                        await client.query(`INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4)`, ['admin@nexoshare.com', hash, 'Super Admin', true]);
-                        console.log('✅ DB Initialized & Healed. Login: admin@nexoshare.com / admin123');
+                        await client.query(`INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4)`, ['admin@nexoshare.nl', hash, 'Super Admin', true]);
+                        console.log('✅ DB Initialized & Healed. Login: admin@nexoshare.nl / admin123');
                     } else {
                         console.log('✅ DB Ready & Up-to-date');
                     }

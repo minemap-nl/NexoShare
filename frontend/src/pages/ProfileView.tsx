@@ -362,7 +362,7 @@ export function ProfileView({ user, config, forcedSetup = false, onComplete }: {
             return;
         }
 
-        let rawAppName = (config.appName || 'Nexo Share').replace(/[^a-zA-Z0-9_\-]/g, '').trim();
+        let rawAppName = (config.appName || 'Nexo Share').replace(/[^a-zA-Z0-9_-]/g, '').trim();
         let safeAppName = DOMPurify.sanitize(rawAppName);
         if (!safeAppName) safeAppName = 'Nexo-Share';
 

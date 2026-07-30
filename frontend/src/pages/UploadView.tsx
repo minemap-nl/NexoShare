@@ -48,6 +48,7 @@ import { GlobalStyles } from '../components/layout/GlobalStyles';
 import { Footer } from '../components/layout/Footer';
 import { ModalPortal } from '../components/ui/ModalPortal';
 import { CopyButton } from '../components/ui/CopyButton';
+import { ShareButton } from '../components/ui/ShareButton';
 import { Checkbox } from '../components/ui/Checkbox';
 import { ExtensionSelector } from '../components/ui/ExtensionSelector';
 import { Tooltip } from '../components/ui/Tooltip';
@@ -566,6 +567,16 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
         }
     }, [result]);
 
+    const shareExpiresAt = (() => {
+        const val = options.expirationVal;
+        if (val === '' || val === undefined || val === null || Number(val) <= 0) return null;
+        const k: Record<string, number> = {
+            Minutes: 60000, Hours: 3600000, Days: 86400000,
+            Weeks: 604800000, Months: 2592000000, Years: 31536000000,
+        };
+        return new Date(Date.now() + Number(val) * (k[options.expirationUnit] || 604800000));
+    })();
+
     if (result) return (
         <div className="bg-neutral-900 p-4 md:p-8 rounded-2xl border border-neutral-800 text-center max-w-xl mx-auto mt-10 shadow-2xl anim-scale">
             <div className="w-16 h-16 md:w-20 md:h-20 bg-primary/20 rounded-full flex items-center justify-center mx-auto mb-4 md:mb-6"><Check className="text-primary-400 w-8 h-8 md:w-10 md:h-10" /></div>
@@ -575,8 +586,18 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
             )}
 
             <div className="bg-black/50 p-4 rounded-xl mb-6 border border-neutral-800">
-                <div className="flex items-center gap-3 mb-4">
+                <div className="flex flex-col sm:flex-row items-stretch gap-3 mb-4">
                     <CopyButton text={result.shareUrl} className="flex-1 bg-transparent text-white px-2 outline-none font-mono text-sm justify-center break-all whitespace-normal text-center" />
+                    <ShareButton
+                        variant="outbound"
+                        url={result.shareUrl}
+                        name={options.name}
+                        description={options.message}
+                        expiresAt={shareExpiresAt}
+                        locale={appCfg?.appLocale}
+                        onCopied={() => notify('Copied to clipboard', 'success')}
+                        className="w-full sm:w-auto shrink-0"
+                    />
                 </div>
                 {/* QR Code Sectie - Klikbaar om te kopiëren */}
                 {qrCode && (
