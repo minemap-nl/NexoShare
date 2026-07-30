@@ -48,6 +48,7 @@ import { GlobalStyles } from '../components/layout/GlobalStyles';
 import { Footer } from '../components/layout/Footer';
 import { ModalPortal } from '../components/ui/ModalPortal';
 import { CopyButton } from '../components/ui/CopyButton';
+import { ShareButton } from '../components/ui/ShareButton';
 import { Checkbox } from '../components/ui/Checkbox';
 import { ExtensionSelector } from '../components/ui/ExtensionSelector';
 import { Tooltip } from '../components/ui/Tooltip';
@@ -311,6 +312,15 @@ export function MySharesView({ active }: { active: boolean }) {
                 fd.append('expirationUnit', editing.newExpirationUnit || 'Days');
             }
 
+            if (editing.newMaxDownloads !== undefined) {
+                fd.append(
+                    'maxDownloads',
+                    editing.newMaxDownloads === '' || editing.newMaxDownloads === null
+                        ? ''
+                        : String(editing.newMaxDownloads)
+                );
+            }
+
             // Add Staged Files
             if (stagedFiles.length > 0) {
                 fd.append('staged_files', JSON.stringify(stagedFiles));
@@ -375,11 +385,24 @@ export function MySharesView({ active }: { active: boolean }) {
                                     {s.max_downloads ? ` / ${s.max_downloads}` : ''}
                                 </span>
                             </div>
-                            <div className="mt-3"><CopyButton text={s.url} className="text-primary-300 hover:text-primary-200 text-sm bg-primary/10 px-2 py-1 rounded w-fit break-all text-left whitespace-normal" /></div>
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                                <CopyButton text={s.url} className="text-primary-300 hover:text-primary-200 text-sm bg-primary/10 px-2 py-1 rounded w-fit break-all text-left whitespace-normal" />
+                                <ShareButton
+                                    variant="outbound"
+                                    compact
+                                    showLabel
+                                    url={s.url}
+                                    name={s.name}
+                                    description={s.message}
+                                    expiresAt={s.expires_at ?? null}
+                                    locale={msCfg?.appLocale}
+                                    onCopied={() => notify('Copied to clipboard', 'success')}
+                                />
+                            </div>
                         </div>
                         <div className="flex gap-2 flex-shrink-0 self-start">
                             <button
-                                onClick={() => setEditing(s)}
+                                onClick={() => setEditing({ ...s, newMaxDownloads: s.max_downloads ?? '' })}
                                 className="p-2 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition"
                                 title="Edit"
                             >
@@ -507,6 +530,24 @@ export function MySharesView({ active }: { active: boolean }) {
                                                 New date: <span className="text-primary-300">{getFutureDate(editing.newExpirationVal, editing.newExpirationUnit || 'Days')}</span>
                                             </p>
                                         )}
+                                    </div>
+                                    <div>
+                                        <label className="label-form-compact">Max downloads</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            className="input-field"
+                                            placeholder="Unlimited"
+                                            value={editing.newMaxDownloads === '' || editing.newMaxDownloads === null || editing.newMaxDownloads === undefined ? '' : editing.newMaxDownloads}
+                                            onChange={e => {
+                                                const v = e.target.value;
+                                                setEditing({
+                                                    ...editing,
+                                                    newMaxDownloads: v === '' ? '' : parseInt(v, 10),
+                                                });
+                                            }}
+                                        />
+                                        <p className="text-[10px] text-neutral-500 mt-1">Leave empty for unlimited. Increasing the limit regenerates the download ZIP.</p>
                                     </div>
                                 </div>
 

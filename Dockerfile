@@ -4,6 +4,10 @@
 FROM oven/bun:1 AS frontend-builder
 WORKDIR /app/frontend
 
+RUN apt-get update \
+  && apt-get upgrade -y --no-install-recommends \
+  && rm -rf /var/lib/apt/lists/*
+
 # Kopieer package files
 COPY frontend/package.json frontend/bun.lock ./
 # Installeer dependencies
@@ -19,17 +23,20 @@ RUN bun run build
 FROM oven/bun:1-alpine
 WORKDIR /app/backend
 
-# Tijdzone data (vaak nodig)
-RUN apk upgrade --no-cache && apk add --no-cache tzdata
+# Tijdzone data (vaak nodig) + OS patches
+RUN apk update && apk upgrade --no-cache \
+  && apk add --no-cache tzdata
 
-# Kopieer backend package config
+# Kopieer backend package config + dedupe-script (nodig voor postinstall)
 COPY backend/package.json backend/bun.lock ./
+COPY backend/scripts/dedupe-peculiar.mjs ./scripts/dedupe-peculiar.mjs
 
 # Installeer productie dependencies
 RUN bun install --frozen-lockfile --production
 
 # Kopieer broncode (Bun voert TS direct uit, dus geen build stap nodig)
 COPY backend/src ./src
+COPY backend/scripts ./scripts
 COPY backend/tsconfig.json ./
 
 # Kopieer de gebouwde frontend assets naar de juiste plek relatief aan backend

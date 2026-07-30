@@ -48,6 +48,7 @@ import { GlobalStyles } from '../components/layout/GlobalStyles';
 import { Footer } from '../components/layout/Footer';
 import { ModalPortal } from '../components/ui/ModalPortal';
 import { CopyButton } from '../components/ui/CopyButton';
+import { ShareButton } from '../components/ui/ShareButton';
 import { Checkbox } from '../components/ui/Checkbox';
 import { Tooltip } from '../components/ui/Tooltip';
 import { ExtensionSelector } from '../components/ui/ExtensionSelector';
@@ -73,6 +74,11 @@ export function ReverseView({ active }: { active: boolean }) {
     });
     const [idLength, setIdLength] = useState(12);
     const [copiedId, setCopiedId] = useState<string | null>(null);
+    const [createResult, setCreateResult] = useState<{
+        url: string;
+        name?: string;
+        expiresAt?: string | null;
+    } | null>(null);
     const { notify, confirm, preview, isConfirming, isPreviewing } = useUI();
     const { config: revCfg } = useAppConfig();
 
@@ -133,15 +139,19 @@ export function ReverseView({ active }: { active: boolean }) {
         });
 
         if (res.ok) {
+            const data = await res.json();
             setCreateMode(false);
-            // Reset formulier
+            setCreateResult({
+                url: data.url,
+                name: data.name,
+                expiresAt: data.expiresAt ?? null,
+            });
             setNewShare({
                 name: '', maxSizeVal: 1, maxSizeUnit: 'GB', expirationVal: 1,
                 expirationUnit: 'Weeks', password: '', notify: true,
                 sendEmailTo: '', thankYouMessage: '', customSlug: ''
             });
             loadReverse();
-            notify("Reverse share created", "success");
         } else {
             const data = await res.json();
             notify(data.error || "Creation failed", "error");
@@ -166,6 +176,41 @@ export function ReverseView({ active }: { active: boolean }) {
         setCopiedId(id);
         setTimeout(() => setCopiedId(null), 2000);
     };
+
+    if (createResult) {
+        return (
+            <div className="bg-neutral-900 p-4 md:p-8 rounded-2xl border border-neutral-800 text-center max-w-xl mx-auto mt-10 shadow-2xl anim-scale">
+                <div className="w-16 h-16 md:w-20 md:h-20 bg-primary/20 rounded-full flex items-center justify-center mx-auto mb-4 md:mb-6">
+                    <Check className="text-primary-400 w-8 h-8 md:w-10 md:h-10" />
+                </div>
+                <h2 className="text-2xl md:text-3xl font-bold text-white mb-6">Link created!</h2>
+                <div className="bg-black/50 p-4 rounded-xl mb-6 border border-neutral-800">
+                    <div className="flex flex-col sm:flex-row items-stretch gap-3">
+                        <CopyButton
+                            text={createResult.url}
+                            className="flex-1 bg-transparent text-white px-2 outline-none font-mono text-sm justify-center break-all whitespace-normal text-center"
+                        />
+                        <ShareButton
+                            variant="reverse"
+                            url={createResult.url}
+                            name={createResult.name}
+                            expiresAt={createResult.expiresAt}
+                            locale={revCfg?.appLocale}
+                            onCopied={() => notify('Copied to clipboard', 'success')}
+                            className="w-full sm:w-auto shrink-0"
+                        />
+                    </div>
+                </div>
+                <button
+                    type="button"
+                    onClick={() => setCreateResult(null)}
+                    className="text-neutral-400 hover:text-white underline transition"
+                >
+                    Create another link
+                </button>
+            </div>
+        );
+    }
 
     if (viewFiles) {
         // Compute tree on the fly (or memoize if slow)
@@ -425,7 +470,7 @@ export function ReverseView({ active }: { active: boolean }) {
                     <div key={s.id} className="bg-neutral-900 p-4 md:p-6 rounded-xl border border-neutral-800 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 hover:border-neutral-600 transition duration-300">
                         <div>
                             <h4 className="font-bold text-white flex items-center gap-2">{s.name} {s.protected && <LockIcon className="w-3 h-3 text-yellow-500" />}</h4>
-                            <div className="flex gap-4 text-sm text-neutral-400 mt-1 flex-wrap">
+                            <div className="flex gap-2 md:gap-3 text-sm text-neutral-400 mt-1 flex-wrap items-center">
                                 <CopyButton text={s.url} className="bg-primary/10 text-primary-300 px-2 rounded font-mono break-all text-left whitespace-normal" />
                                 <span>{s.file_count || 0} receive files</span>
 
@@ -434,7 +479,18 @@ export function ReverseView({ active }: { active: boolean }) {
                                 <span>Expires on: {s.expires_at ? new Date(s.expires_at).toLocaleDateString() : 'Never'}</span>
                             </div>
                         </div>
-                        <div className="flex gap-2">
+                        <div className="flex gap-2 items-center flex-shrink-0">
+                            <ShareButton
+                                variant="reverse"
+                                compact
+                                showLabel
+                                iconRow
+                                url={s.url}
+                                name={s.name}
+                                expiresAt={s.expires_at ?? null}
+                                locale={revCfg?.appLocale}
+                                onCopied={() => notify('Copied to clipboard', 'success')}
+                            />
                             <button
                                 onClick={() => handleCopy(s.id, s.url)}
                                 className={`p-2 rounded transition-all duration-300 ${copiedId === s.id

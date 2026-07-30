@@ -1,5 +1,6 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 
 // Dev: start de backend apart (standaard poort 3001, zie backend/src/index.ts). Zonder draaiende API
 // geeft Vite ECONNREFUSED op /api en /site.webmanifest — dat is verwacht gedrag.
@@ -9,7 +10,7 @@ export default defineConfig(({ mode }) => {
   const proxyTarget = env.VITE_PROXY_TARGET || 'http://127.0.0.1:3001'
 
   return {
-    plugins: [react()],
+    plugins: [react(), tailwindcss()],
     server: {
       proxy: {
         '/api': {

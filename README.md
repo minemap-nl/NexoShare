@@ -2,7 +2,7 @@
 
 <br />
 <div align="center">
-  <a href="https://nexoshare.nl">
+  <a href="https://nexoshare.famretera.nl">
     <img src="./frontend/public/logo.svg" alt="Nexo Share Logo" width="120" />
   </a>
 
@@ -12,7 +12,7 @@
     A powerful, self-hosted, and secure file-sharing platform.<br />
     Share large files securely with password protection, expiration dates, and 2FA support.
     <br /><br />
-    <a href="https://nexoshare.nl"><strong>View Demo & More Info »</strong></a>
+    <a href="https://nexoshare.famretera.nl"><strong>View Demo & More Info »</strong></a>
     <br /><br />
     <a href="https://github.com/minemap-nl/nexoshare/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
     &middot;
@@ -66,18 +66,31 @@ Unlike many standard open-source solutions, Nexo Share focuses heavily on securi
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
+### Built With
+
+* [React][react-url]
+* [TypeScript][typescript-url]
+* [Bun][bun-url]
+* [Express][express-url]
+* [PostgreSQL][postgresql-url]
+* [Docker][docker-url]
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 ---
 
 ## Key Features
 
-* **🔒 Secure Sharing** — Password-protected shares with automatic expiration.
+* **🔒 Secure Sharing** — Password-protected shares with automatic expiration and editable download limits.
 * **📂 Chunked Uploads** — Reliably upload very large files and folders (limited only by server storage).
+* **📦 Prebuilt ZIP Cache** — Background ZIP generation for faster share downloads (`SHARE_ZIPS_DIR`).
+* **📤 Smart Share** — Copy a ready-to-send message (or use the native share sheet on mobile).
 * **🔄 Reverse Shares** — Public drop-off links that allow guests to securely upload files to you.
 * **🛡️ Advanced Security**
   * Two-Factor Authentication (TOTP)
   * Passkey support (Face ID, Touch ID, Windows Hello)
-  * ClamAV virus scanning integration
-* **🔑 SSO Support** — OpenID Connect (OIDC) integration.
+  * ClamAV virus scanning (always on for reverse shares; optional for internal shares)
+* **🔑 SSO Support** — OpenID Connect (OIDC) with optional admin groups (authoritative when set; skipped when empty).
 * **⚙️ Admin Dashboard** — Manage users, global settings, SMTP configuration, and audit logs.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
@@ -101,7 +114,7 @@ The recommended way to install **Nexo Share** is via **Docker**.
 ```yaml
 services:
   nexoshare:
-    image: ghcr.io/minemap-nl/nexoshare:latest
+    image: ghcr.io/minemap-nl/nexoshare:v.1.06 # or :latest
     container_name: nexoshare
     restart: unless-stopped
     ports:
@@ -122,6 +135,10 @@ services:
       APP_LOCALE: en-GB
       CLAMAV_HOST: clamav
       CLAMAV_PORT: 3310
+      # Optional: prebuilt share ZIP cache (default: $UPLOAD_DIR/share_zips)
+      # SHARE_ZIPS_DIR: /app/backend/uploads/share_zips
+      # Optional: extra CSP connect-src / default-src origins (comma-separated)
+      # CSP_EXTRA_CONNECT_ORIGINS: https://analytics.example.com
     volumes:
       - ./uploads:/app/backend/uploads
     depends_on:
@@ -169,6 +186,9 @@ services:
       - ./clamav:/var/lib/clamav
 ```
 
+
+See [RELEASE_NOTES.md](./RELEASE_NOTES.md) for v.1.06 changes.
+
 4. Start the stack:
 
 ```sh
@@ -193,21 +213,10 @@ http://localhost:3000
 
 On first startup, database tables are created automatically. If no users exist, a default admin account is created:
 
-* **Email:** `admin@nexoshare.com`
+* **Email:** `admin@nexoshare.nl`
 * **Password:** `admin123`
 
 > ⚠️ **Important:** Log in immediately and change these credentials.
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-### Built With
-
-* [React][react-url]
-* [TypeScript][typescript-url]
-* [Bun][bun-url]
-* [Express][express-url]
-* [PostgreSQL][postgresql-url]
-* [Docker][docker-url]
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -232,7 +241,7 @@ See the `LICENSE` file for details.
 ## Contact
 
 **Minemap / Famretera**  
-Website: https://nexoshare.nl
+Website: https://nexoshare.famretera.nl
 
 Project Repository: https://github.com/minemap-nl/nexoshare
 

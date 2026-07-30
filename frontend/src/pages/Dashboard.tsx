@@ -34,8 +34,16 @@ export function Dashboard({ token, logout }: any) {
     // Check of setup nodig is bij laden (geen auto-wizard in demo — voorkomt "quick start" bij elke login)
     useEffect(() => {
         if (!user || !config || config.setupCompleted || config.demoMode) return;
-        if (user.email === 'admin@nexoshare.com') setShowSetup(true);
+        if (user.email === 'admin@nexoshare.nl') setShowSetup(true);
     }, [user, config]);
+
+    // After SSO group-test resync, land back on Configuration
+    useEffect(() => {
+        if (!user?.is_admin) return;
+        if (sessionStorage.getItem('pendingSsoAdminGroupTest')) {
+            setView('config');
+        }
+    }, [user]);
     useTokenExpiration(token, logout);
 
     useEffect(() => {
