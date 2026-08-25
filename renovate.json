@@ -3,18 +3,23 @@
   "extends": [
     "config:recommended"
   ],
+  "timezone": "Europe/Amsterdam",
+  "schedule": ["before 9am on Monday"],
   "semanticCommits": "enabled",
   "semanticCommitType": "chore",
   "semanticCommitScope": "deps",
   "packageRules": [
     {
-      "description": "Automerge non-major updates after CI passes",
+      "description": "Weekly bundled minor/patch PR; automerge after CI",
       "matchUpdateTypes": ["minor", "patch"],
       "matchFileNames": [
         "frontend/package.json",
         "backend/package.json",
         "package.json"
       ],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-minor-patch",
+      "schedule": ["before 9am on Monday"],
       "automerge": true,
       "automergeType": "pr"
     }
