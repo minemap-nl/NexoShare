@@ -39,3 +39,6 @@ Thumbs.db
 coverage/
 
 .cursor/
+
+# Local email template preview (not for GitHub)
+email-preview.html

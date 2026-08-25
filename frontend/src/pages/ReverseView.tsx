@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
+import { listContainerVariants, listItemVariants } from '../lib/motionPresets';
 
 import { useParams } from 'react-router-dom';
 import {
@@ -465,48 +466,63 @@ export function ReverseView({ active }: { active: boolean }) {
                 </div>
             )}
 
-            <div className="grid gap-4">
-                {shares.map(s => (
-                    <div key={s.id} className="bg-neutral-900 p-4 md:p-6 rounded-xl border border-neutral-800 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 hover:border-neutral-600 transition duration-300">
-                        <div>
-                            <h4 className="font-bold text-white flex items-center gap-2">{s.name} {s.protected && <LockIcon className="w-3 h-3 text-yellow-500" />}</h4>
-                            <div className="flex gap-2 md:gap-3 text-sm text-neutral-400 mt-1 flex-wrap items-center">
-                                <CopyButton text={s.url} className="bg-primary/10 text-primary-300 px-2 rounded font-mono break-all text-left whitespace-normal" />
-                                <span>{s.file_count || 0} receive files</span>
+            <motion.div
+                className="grid gap-4"
+                variants={listContainerVariants}
+                initial="hidden"
+                animate="visible"
+            >
+                <AnimatePresence>
+                    {shares.map(s => (
+                        <motion.div
+                            key={s.id}
+                            variants={listItemVariants}
+                            initial="hidden"
+                            animate="visible"
+                            exit="exit"
+                            transition={{ duration: 0.25, ease: 'easeOut' }}
+                            className="bg-neutral-900 p-4 md:p-6 rounded-xl border border-neutral-800 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 hover:border-neutral-600 transition duration-300"
+                        >
+                            <div>
+                                <h4 className="font-bold text-white flex items-center gap-2">{s.name} {s.protected && <LockIcon className="w-3 h-3 text-yellow-500" />}</h4>
+                                <div className="flex gap-2 md:gap-3 text-sm text-neutral-400 mt-1 flex-wrap items-center">
+                                    <CopyButton text={s.url} className="bg-primary/10 text-primary-300 px-2 rounded font-mono break-all text-left whitespace-normal" />
+                                    <span>{s.file_count || 0} receive files</span>
 
-                                {/* Datum weergave */}
-                                <span className="hidden sm:inline">•</span>
-                                <span>Expires on: {s.expires_at ? new Date(s.expires_at).toLocaleDateString() : 'Never'}</span>
+                                    {/* Datum weergave */}
+                                    <span className="hidden sm:inline">•</span>
+                                    <span>Expires on: {s.expires_at ? new Date(s.expires_at).toLocaleDateString() : 'Never'}</span>
+                                </div>
                             </div>
-                        </div>
-                        <div className="flex gap-2 items-center flex-shrink-0">
-                            <ShareButton
-                                variant="reverse"
-                                compact
-                                showLabel
-                                iconRow
-                                url={s.url}
-                                name={s.name}
-                                expiresAt={s.expires_at ?? null}
-                                locale={revCfg?.appLocale}
-                                onCopied={() => notify('Copied to clipboard', 'success')}
-                            />
-                            <button
-                                onClick={() => handleCopy(s.id, s.url)}
-                                className={`p-2 rounded transition-all duration-300 ${copiedId === s.id
-                                    ? 'bg-green-600 text-white scale-110'
-                                    : 'bg-neutral-700 hover:bg-neutral-600 text-white'
-                                    }`}
-                                title="Copy link"
-                            >
-                                {copiedId === s.id ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                            </button>
-                            <button onClick={() => openFiles(s.id)} className="p-2 bg-primary hover:bg-primary-700 rounded text-white transition" title="View files"><Eye className="w-4 h-4" /></button>
-                            <button onClick={() => deleteReverse(s.id)} className="p-2 bg-red-500/10 text-red-500 hover:bg-red-500/20 rounded transition"><Trash2 className="w-4 h-4" /></button>
-                        </div>
-                    </div>
-                ))}
-            </div>
+                            <div className="flex gap-2 items-center flex-shrink-0">
+                                <ShareButton
+                                    variant="reverse"
+                                    compact
+                                    showLabel
+                                    iconRow
+                                    url={s.url}
+                                    name={s.name}
+                                    expiresAt={s.expires_at ?? null}
+                                    locale={revCfg?.appLocale}
+                                    onCopied={() => notify('Copied to clipboard', 'success')}
+                                />
+                                <button
+                                    onClick={() => handleCopy(s.id, s.url)}
+                                    className={`p-2 rounded transition-all duration-300 ${copiedId === s.id
+                                        ? 'bg-green-600 text-white scale-110'
+                                        : 'bg-neutral-700 hover:bg-neutral-600 text-white'
+                                        }`}
+                                    title="Copy link"
+                                >
+                                    {copiedId === s.id ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                                </button>
+                                <button onClick={() => openFiles(s.id)} className="p-2 bg-primary hover:bg-primary-700 rounded text-white transition" title="View files"><Eye className="w-4 h-4" /></button>
+                                <button onClick={() => deleteReverse(s.id)} className="p-2 bg-red-500/10 text-red-500 hover:bg-red-500/20 rounded transition"><Trash2 className="w-4 h-4" /></button>
+                            </div>
+                        </motion.div>
+                    ))}
+                </AnimatePresence>
+            </motion.div>
         </div>
     );
 };

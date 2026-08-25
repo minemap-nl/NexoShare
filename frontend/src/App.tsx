@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { MotionConfig } from 'motion/react';
 import { AppConfigProvider } from './context/AppConfigContext';
 import { UIProvider } from './context/UIContext';
 import { DemoBanner } from './components/layout/DemoBanner';
@@ -14,20 +15,22 @@ function App() {
     if (loading) return <div className="bg-black min-h-screen" />;
 
     return (
-        <BrowserRouter>
-            <AppConfigProvider>
-                <UIProvider>
-                    <DemoBanner />
-                    <Routes>
-                        <Route path="/s/:id" element={<DownloadPage />} />
-                        <Route path="/r/:id" element={<GuestUploadPage />} />
-                        <Route path="/login" element={!user ? <LoginPage onLogin={login} /> : <Navigate to="/" />} />
-                        <Route path="/reset-password" element={<PasswordResetPage />} />
-                        <Route path="/*" element={user ? <Dashboard token={token} logout={logout} /> : <Navigate to="/login" />} />
-                    </Routes>
-                </UIProvider>
-            </AppConfigProvider>
-        </BrowserRouter>
+        <MotionConfig reducedMotion="user">
+            <BrowserRouter>
+                <AppConfigProvider>
+                    <UIProvider>
+                        <DemoBanner />
+                        <Routes>
+                            <Route path="/s/:id" element={<DownloadPage />} />
+                            <Route path="/r/:id" element={<GuestUploadPage />} />
+                            <Route path="/login" element={!user ? <LoginPage onLogin={login} /> : <Navigate to="/" />} />
+                            <Route path="/reset-password" element={<PasswordResetPage />} />
+                            <Route path="/*" element={user ? <Dashboard token={token} logout={logout} /> : <Navigate to="/login" />} />
+                        </Routes>
+                    </UIProvider>
+                </AppConfigProvider>
+            </BrowserRouter>
+        </MotionConfig>
     );
 }
 

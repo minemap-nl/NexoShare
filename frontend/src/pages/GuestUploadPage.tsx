@@ -9,6 +9,7 @@ import { API_URL } from '../api/constants';
 import {
     computeChunkHash,
     getBackoffDelay,
+    getUploadErrorMessage,
     generateUUID,
     sortFiles,
     synthesizeDirectoryItems,
@@ -146,17 +147,17 @@ export function GuestUploadPage() {
                 const chunk = file.slice(start, end);
                 
                 const chunkHash = await computeChunkHash(chunk);
-                
-                const fd = new FormData();
-                fd.append('chunk', chunk);
-                fd.append('chunkIndex', chunkIndex.toString());
-                fd.append('fileName', file.name);
-                fd.append('fileId', fileId);
-                fd.append('chunkHash', chunkHash);
 
                 let attempts = 0;
                 const maxAttempts = 10;
                 while (attempts < maxAttempts) {
+                    const fd = new FormData();
+                    fd.append('chunk', chunk);
+                    fd.append('chunkIndex', chunkIndex.toString());
+                    fd.append('fileName', file.name);
+                    fd.append('fileId', fileId);
+                    fd.append('chunkHash', chunkHash);
+
                     try {
                         await axios.post(`${API_URL}/public/reverse/${id}/chunk`, fd, {
                             headers: { 'X-Chunk-Size': CHUNK_SIZE.toString() },
@@ -230,8 +231,18 @@ export function GuestUploadPage() {
                 notify('Upload cancelled', 'info');
                 return;
             }
-            
-            await axios.post(`${API_URL}/public/reverse/${id}/finalize`, { files: uploadedFilesMeta });
+
+            try {
+                await axios.post(`${API_URL}/public/reverse/${id}/finalize`, { files: uploadedFilesMeta });
+            } catch (err: any) {
+                const status = err?.response?.status;
+                if (status === 503 || status === 504 || status === 502) {
+                    await new Promise(res => setTimeout(res, getBackoffDelay(1)));
+                    await axios.post(`${API_URL}/public/reverse/${id}/finalize`, { files: uploadedFilesMeta });
+                } else {
+                    throw err;
+                }
+            }
             setFinalizing(false);
             setSuccess(true);
 
@@ -241,7 +252,7 @@ export function GuestUploadPage() {
                 notify('Upload cancelled', 'info');
                 return;
             }
-            const msg = e.response?.data?.error || e.message || 'Error during upload';
+            const msg = getUploadErrorMessage(e, 'Error during upload');
             notify(msg, "error");
         } finally {
             delete (window as any).__uploadAbortController;

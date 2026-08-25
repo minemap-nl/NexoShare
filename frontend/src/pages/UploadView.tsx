@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 
 import { useParams } from 'react-router-dom';
 import {
@@ -34,6 +34,7 @@ import {
     getFutureDate,
     computeChunkHash,
     getBackoffDelay,
+    getUploadErrorMessage,
     generateUUID,
     isValidHttpUrl,
     sortFiles,
@@ -339,19 +340,20 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
                 const chunk = file.slice(start, end);
                 const chunkHash = await computeChunkHash(chunk);
 
-                const fd = new FormData();
-                fd.append('chunk', chunk);
-                fd.append('chunkIndex', chunkIndex.toString());
-                fd.append('totalChunks', totalChunks.toString());
-                fd.append('fileName', file.name);
-                fd.append('fileId', fileId);
-                fd.append('totalFileSize', String(file.size));
-                fd.append('chunkHash', chunkHash);
-
                 let attempts = 0;
                 const maxAttempts = 10;
 
                 while (attempts < maxAttempts) {
+                    // Fresh FormData per attempt — reused bodies can fail after a timed-out request.
+                    const fd = new FormData();
+                    fd.append('chunk', chunk);
+                    fd.append('chunkIndex', chunkIndex.toString());
+                    fd.append('totalChunks', totalChunks.toString());
+                    fd.append('fileName', file.name);
+                    fd.append('fileId', fileId);
+                    fd.append('totalFileSize', String(file.size));
+                    fd.append('chunkHash', chunkHash);
+
                     try {
                         await axios.post(`${API_URL}/shares/${shareId}/chunk`, fd, {
                             headers: { 'X-Chunk-Size': CHUNK_SIZE.toString() },
@@ -449,9 +451,24 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
             }
 
             setFinalizing(true);
-            const finalRes = await axios.post(`${API_URL}/shares/${shareId}/finalize`, {
-                files: uploadedFilesMeta
-            });
+            let finalRes;
+            try {
+                finalRes = await axios.post(`${API_URL}/shares/${shareId}/finalize`, {
+                    files: uploadedFilesMeta
+                });
+            } catch (err: any) {
+                // 503 = scan timed out before commit — safe to retry once.
+                // 504 is ambiguous (proxy may have dropped a successful response); rely on idempotent finalize.
+                const status = err?.response?.status;
+                if (status === 503 || status === 504 || status === 502) {
+                    await new Promise(res => setTimeout(res, getBackoffDelay(1)));
+                    finalRes = await axios.post(`${API_URL}/shares/${shareId}/finalize`, {
+                        files: uploadedFilesMeta
+                    });
+                } else {
+                    throw err;
+                }
+            }
             setFinalizing(false);
 
             if (finalRes.data.success) {
@@ -491,7 +508,7 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
                 dispatchSharesListChanged();
             }
 
-            const msg = e.response?.data?.error || e.message || 'Upload failed';
+            const msg = getUploadErrorMessage(e);
             notify(msg, "error");
         } finally {
             dispatchActiveUploadShare(null);

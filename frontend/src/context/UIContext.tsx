@@ -1,8 +1,9 @@
 import React, { createContext, useCallback, useContext, useState } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 import { X, Check, AlertTriangle, Info } from 'lucide-react';
 import FilePreviewModal from '../components/preview/FilePreviewModal';
 import { useEscapeKey } from '../hooks/useEscapeKey';
+import { backdropVariants, modalTransition, panelVariants, springSnappy, toastVariants } from '../lib/motionPresets';
 import type { Toast, ToastType, UIContextType } from '../types/ui';
 
 const UIContext = createContext<UIContextType | null>(null);
@@ -62,39 +63,51 @@ export function UIProvider({ children }: { children: React.ReactNode }) {
         <UIContext.Provider value={{ notify, confirm, preview, isConfirming: !!confirmMessage, isPreviewing: !!previewFile }}>
             {children}
             <div className="pointer-events-none fixed bottom-4 right-4 z-[10003] flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-2">
-                {toasts.map(toast => (
-                    <div
-                        key={toast.id}
-                        className={`pointer-events-auto flex items-start gap-3 rounded-xl p-4 text-sm font-medium text-white shadow-lg anim-slide ${toast.type === 'error' ? 'bg-red-500' :
-                            toast.type === 'success' ? 'bg-green-500' :
-                                'border border-neutral-700 bg-neutral-800'
-                            }`}
-                    >
-                        <span className="mt-0.5 shrink-0">
-                            {toast.type === 'error' ? <AlertTriangle className="h-5 w-5" /> :
-                                toast.type === 'success' ? <Check className="h-5 w-5" /> :
-                                    <Info className="h-5 w-5 text-primary-300" />}
-                        </span>
-                        <span className="min-w-0 flex-1 break-words leading-snug">{toast.message}</span>
-                        <button type="button" onClick={() => removeToast(toast.id)} className="ml-1 shrink-0 rounded p-1 hover:bg-black/20"><X className="h-3 w-3" /></button>
-                    </div>
-                ))}
+                <AnimatePresence mode="popLayout">
+                    {toasts.map(toast => (
+                        <motion.div
+                            key={toast.id}
+                            layout
+                            variants={toastVariants}
+                            initial="hidden"
+                            animate="visible"
+                            exit="exit"
+                            transition={springSnappy}
+                            className={`pointer-events-auto flex items-start gap-3 rounded-xl p-4 text-sm font-medium text-white shadow-lg ${toast.type === 'error' ? 'bg-red-500' :
+                                toast.type === 'success' ? 'bg-green-500' :
+                                    'border border-neutral-700 bg-neutral-800'
+                                }`}
+                        >
+                            <span className="mt-0.5 shrink-0">
+                                {toast.type === 'error' ? <AlertTriangle className="h-5 w-5" /> :
+                                    toast.type === 'success' ? <Check className="h-5 w-5" /> :
+                                        <Info className="h-5 w-5 text-primary-300" />}
+                            </span>
+                            <span className="min-w-0 flex-1 break-words leading-snug">{toast.message}</span>
+                            <button type="button" onClick={() => removeToast(toast.id)} className="ml-1 shrink-0 rounded p-1 hover:bg-black/20"><X className="h-3 w-3" /></button>
+                        </motion.div>
+                    ))}
+                </AnimatePresence>
             </div>
 
             <AnimatePresence>
                 {confirmMessage && (
                     <motion.div
                         key="confirm-modal"
-                        initial={{ opacity: 0, backdropFilter: 'blur(0px)' }}
-                        animate={{ opacity: 1, backdropFilter: 'blur(4px)' }}
-                        exit={{ opacity: 0, backdropFilter: 'blur(0px)' }}
+                        variants={backdropVariants}
+                        initial="hidden"
+                        animate="visible"
+                        exit="exit"
+                        transition={modalTransition}
                         className="fixed inset-0 z-[10002] flex items-center justify-center p-4 bg-black/60"
                         onClick={cancelConfirm}
                     >
                         <motion.div
-                            initial={{ scale: 0.95, opacity: 0 }}
-                            animate={{ scale: 1, opacity: 1 }}
-                            exit={{ scale: 0.95, opacity: 0 }}
+                            variants={panelVariants}
+                            initial="hidden"
+                            animate="visible"
+                            exit="exit"
+                            transition={springSnappy}
                             onClick={(e: React.MouseEvent) => e.stopPropagation()}
                             className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl shadow-2xl max-w-sm w-full"
                         >

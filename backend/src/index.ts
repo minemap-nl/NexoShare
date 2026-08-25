@@ -46,6 +46,7 @@ import {
     resolveSsoAdminFromGroups,
     userMatchesSsoAdminGroups,
 } from './lib/ssoGroups';
+import { buildEmailHtml, resolveEmailLogoSrc, EMAIL_MESSAGE_BOX_STYLE } from './lib/emailTemplate';
 import {
     cleanupOrphanedShareZips,
     computeManifest,
@@ -61,7 +62,7 @@ dotenv.config();
 /** When true (set DEMO_MODE=true in env), aggressive data TTL, no outbound mail, and restricted account routes. */
 const DEMO_MODE = process.env.DEMO_MODE === 'true';
 const DEMO_PUBLIC_URL = process.env.DEMO_APP_URL || 'https://demo-nexoshare.famretera.nl';
-const DEMO_RETENTION_MINUTES = Math.max(1, parseInt(String(process.env.DEMO_DATA_RETENTION_MINUTES || '2'), 10) || 2);
+const DEMO_RETENTION_MINUTES = Math.max(1, Math.min(120, parseInt(String(process.env.DEMO_DATA_RETENTION_MINUTES || '2'), 10) || 2));
 
 /**
  * Demo: per-share / per-upload cap equals ClamAV scan cap (nothing larger can be scanned — no bypass).
@@ -71,6 +72,12 @@ const DEMO_MAX_FILE_MB = Math.max(1, Math.min(512, parseInt(String(process.env.D
 
 /** Demo: max local user rows (default 2: e.g. seed login + wizard-created admin). Set DEMO_MAX_USERS=1 for a single seeded account only. */
 const DEMO_MAX_USERS = Math.max(1, parseInt(String(process.env.DEMO_MAX_USERS || '2'), 10) || 2);
+
+/** ClamAV socket timeout — keep demo well under typical reverse-proxy idle limits (often 30–60s). */
+const CLAMAV_TIMEOUT_MS = DEMO_MODE
+    ? Math.max(5000, Math.min(25000, parseInt(String(process.env.CLAMAV_TIMEOUT_MS || '15000'), 10) || 15000))
+    : Math.max(10000, Math.min(120000, parseInt(String(process.env.CLAMAV_TIMEOUT_MS || '60000'), 10) || 60000));
+
 
 /** Extensions always blocked in demo (executables + loose archives; not Office Open XML). */
 const DEMO_FORCE_BLOCKED_EXTENSIONS: readonly string[] = buildDemoForceBlockedExtensions();
@@ -203,13 +210,13 @@ new NodeClam().init({
     clamdscan: {
         host: CLAMAV_HOST,
         port: CLAMAV_PORT,
-        timeout: 60000,
+        timeout: CLAMAV_TIMEOUT_MS,
         active: true
     },
     preference: 'clamdscan'
 }).then((instance: any) => {
     clamscanInstance = instance;
-    console.log("✅ ClamAV is active and connected.");
+    console.log(`✅ ClamAV is active and connected (timeout ${CLAMAV_TIMEOUT_MS}ms).`);
 }).catch((err: any) => {
     console.warn("⚠️ ClamAV is not found or can't connect:", err.message);
     console.warn("   Virusscanning is turned off.");
@@ -681,10 +688,19 @@ const safeUnlink = async (filePath: string) => {
 const uploadSessionBudget = new Map<string, number>();
 /** Cumulative raw bytes received in chunk POST bodies for this share. */
 const uploadSessionBytesUsed = new Map<string, number>();
+/**
+ * Chunk keys (`shareId:fileId:chunkIndex`) already counted toward session budget.
+ * Prevents double-counting when a proxy returns 502/504 after the server already
+ * accepted the chunk and the client retries the same chunk.
+ */
+const uploadSessionCountedChunks = new Map<string, Set<string>>();
+
+const chunkBudgetKey = (fileId: string, chunkIndex: number) => `${fileId}:${chunkIndex}`;
 
 const clearUploadSessionKeys = (shareId: string) => {
     uploadSessionBudget.delete(shareId);
     uploadSessionBytesUsed.delete(shareId);
+    uploadSessionCountedChunks.delete(shareId);
 };
 
 /** Verwijdert tijdelijke `shareId_*_*.part` bestanden in TEMP_DIR. */
@@ -747,6 +763,7 @@ if (DEMO_MODE) {
         const activeShareSessions = new Set<string>([
             ...uploadSessionBudget.keys(),
             ...uploadSessionBytesUsed.keys(),
+            ...uploadSessionCountedChunks.keys(),
             ...(await getShareIdsWithOpenPartFiles())
         ]);
         const reverseWithParts = await getReverseShareIdsWithOpenGuestParts();
@@ -883,9 +900,10 @@ async function getConfig() {
                 sessionVal: 1,
                 sessionUnit: 'Hours',
                 secureCookies: true,
-                defaultExpirationVal: 5,
+                // Keep share expiry aligned with hard cleanup TTL so demos can upload → download reliably.
+                defaultExpirationVal: DEMO_RETENTION_MINUTES,
                 defaultExpirationUnit: 'Minutes',
-                maxExpirationVal: 5,
+                maxExpirationVal: DEMO_RETENTION_MINUTES,
                 maxExpirationUnit: 'Minutes',
                 /**
                  * No users: force incomplete setup. With users: follow DB `setup_completed` so a seeded
@@ -1114,7 +1132,6 @@ async function sendEmail(to: string, subject: string, rawMessage: string, ctaLin
         return false;
     }
 
-    const safeMessage = rawMessage;
     const safeSubject = sanitizeEmailHeader(subject);
 
     try {
@@ -1128,27 +1145,23 @@ async function sendEmail(to: string, subject: string, rawMessage: string, ctaLin
         );
 
         const appName = config.appName || 'Nexo Share';
-        // Sanitize de naam voor gebruik in headers om injection te voorkomen
         const safeHeaderAppName = sanitizeEmailHeader(appName);
-        const safeAppName = escapeHtml(appName);
-        let safeLink = '#';
-        if (ctaLink && (ctaLink.startsWith('http://') || ctaLink.startsWith('https://'))) safeLink = ctaLink;
+        const baseUrl = getBaseUrl(config);
+        const logoSrc = resolveEmailLogoSrc(config.logoUrl, baseUrl);
 
-        const logoHtml = config.logoUrl
-            ? `<img src="${config.logoUrl}" alt="${safeAppName}" style="display: block; margin: 0 auto; max-height: 50px; border: 0; outline: none; text-decoration: none;">`
-            : `<h1 style="margin: 0; color: #7c3aed; font-size: 24px; font-weight: bold; text-align: center;">${safeAppName}</h1>`;
-
-        const buttonHtml = ctaLink ? `
-            <table role="presentation" border="0" cellpadding="0" cellspacing="0" class="btn btn-primary" style="margin-top: 20px; width: 100%;">
-            <tbody><tr><td align="center"><table role="presentation" border="0" cellpadding="0" cellspacing="0"><tbody><tr><td> <a href="${safeLink}" target="_blank" style="background-color: #7c3aed; border: solid 1px #7c3aed; border-radius: 8px; box-sizing: border-box; color: #ffffff; cursor: pointer; display: inline-block; font-size: 16px; font-weight: bold; margin: 0; padding: 12px 30px; text-decoration: none; text-transform: capitalize;">${escapeHtml(ctaText || 'View')}</a> </td></tr></tbody></table></td></tr></tbody>
-            </table>` : '';
-
-        const html = `<!DOCTYPE html><html lang="en"><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><style>@media only screen and (max-width: 620px) {table.body h1 { font-size: 28px !important; margin-bottom: 10px !important; } table.body p, table.body ul, table.body ol, table.body td, table.body span, table.body a { font-size: 16px !important; } table.body .wrapper, table.body .article { padding: 10px !important; } table.body .content { padding: 0 !important; } table.body .container { padding: 0 !important; width: 100% !important; } table.body .main { border-left-width: 0 !important; border-radius: 0 !important; border-right-width: 0 !important; }} @media (prefers-color-scheme: dark) { body { background-color: #1f2937 !important; color: #ffffff !important; } .email-container { background-color: #111827 !important; border: 1px solid #374151 !important; } h1, h2, h3, p, span, td { color: #f3f4f6 !important; } .content-block { background-color: #1f2937 !important; } .message-box { background-color: #374151 !important; color: #e5e7eb !important; border-left: 4px solid #8b5cf6 !important; } }</style></head><body style="background-color: #f3f4f6; font-family: sans-serif; -webkit-font-smoothing: antialiased; font-size: 14px; line-height: 1.4; margin: 0; padding: 0; -ms-text-size-adjust: 100%; -webkit-text-size-adjust: 100%;"><table role="presentation" border="0" cellpadding="0" cellspacing="0" class="body" style="border-collapse: separate; mso-table-lspace: 0pt; mso-table-rspace: 0pt; background-color: #f3f4f6; width: 100%;"><tr><td>&nbsp;</td><td class="container" style="display: block; margin: 0 auto !important; max-width: 580px; padding: 10px; width: 580px;"><div class="content" style="box-sizing: border-box; display: block; margin: 0 auto; max-width: 580px; padding: 10px;"><table role="presentation" class="main email-container" style="border-collapse: separate; mso-table-lspace: 0pt; mso-table-rspace: 0pt; background: #ffffff; border-radius: 12px; width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);"><tr><td class="wrapper" style="font-family: sans-serif; font-size: 14px; vertical-align: top; box-sizing: border-box; padding: 40px;"><table role="presentation" border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate; mso-table-lspace: 0pt; mso-table-rspace: 0pt; width: 100%;"><tr><td style="font-family: sans-serif; font-size: 14px; vertical-align: top; text-align: center;">${logoHtml}<h2 style="color: #1f2937; margin: 20px 0 10px 0; font-size: 24px;">${safeSubject}</h2><div style="text-align: left; width: 100%;">${safeMessage}</div>${buttonHtml}</td></tr></table></td></tr></table><div class="footer" style="clear: both; margin-top: 10px; text-align: center; width: 100%;"><table role="presentation" border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate; mso-table-lspace: 0pt; mso-table-rspace: 0pt; width: 100%;"><tr><td class="content-block" style="font-family: sans-serif; vertical-align: top; padding-bottom: 10px; padding-top: 10px; color: #9ca3af; font-size: 12px; text-align: center;"><span class="apple-link" style="color: #9ca3af; font-size: 12px; text-align: center;">Sent via ${safeAppName}</span></td></tr></table></div></div></td><td>&nbsp;</td></tr></table></body></html>`;
+        const html = buildEmailHtml({
+            appName,
+            subject: safeSubject,
+            bodyHtml: rawMessage,
+            ctaLink,
+            ctaText,
+            logoSrc,
+        });
 
         // Gebruik smtpFrom als die is ingesteld, anders smtpUser
         const fromEmail = config.smtpFrom || config.smtpUser;
         const fromHeader = fromEmail.includes('<') ? fromEmail : `"${safeHeaderAppName}" <${fromEmail}>`;
-        await transporter.sendMail({ from: fromHeader, to, subject, html });
+        await transporter.sendMail({ from: fromHeader, to, subject: safeSubject, html });
         return true;
     } catch (e: any) {
         // Log the SPECIFIC error to the server console so you can see it
@@ -1215,49 +1228,79 @@ const requireAdmin: RequestHandler = (req, res, next) => {
     next();
 };
 
-const checkUploadLimits: RequestHandler = async (req, res, next) => {
-    // 0. Pause stream immediately to prevent data loss during async config fetch
-    req.pause();
-
-    const config = await getConfig();
-    const maxBytes = getBytes(config.maxSizeVal || 10, config.maxSizeUnit || 'GB');
-    const contentLength = parseInt(req.headers['content-length'] || '0');
-
-    // 1. Header Check
-    if (contentLength > maxBytes) {
-        req.resume(); // Resume to discard/finish properly if needed, though we respond immediately
-        return res.status(413).json({ error: `File too large. Maximum ${config.maxSizeVal} ${config.maxSizeUnit}` });
-    }
-
-    // 2. Stream Monitor (Real-time enforcement)
+const attachUploadByteMonitor = (
+    req: import('express').Request,
+    res: import('express').Response,
+    maxBytes: number,
+    maxSizeVal: number,
+    maxSizeUnit: string
+) => {
     let received = 0;
     const onData = (chunk: Buffer) => {
         received += chunk.length;
         if (received > maxBytes) {
-            // Unsubscribe immediately
             req.off('data', onData);
-            req.unpipe(); // Detach from destination (multer)
-            req.pause();  // Stop flow
-
-            // Allow response to be sent if header not flush
+            req.unpipe();
             if (!res.headersSent) {
-                res.status(413).json({ error: `Upload exceeded limit of ${config.maxSizeVal} ${config.maxSizeUnit}` });
+                res.status(413).json({ error: `Upload exceeded limit of ${maxSizeVal} ${maxSizeUnit}` });
             }
-
-            // Hard Kill connection to save bandwidth
             req.destroy();
         }
     };
-
     req.on('data', onData);
-
-    // Clean up listener on finish/close to prevent leaks
     const onEnd = () => req.off('data', onData);
     res.on('finish', onEnd);
     res.on('close', onEnd);
     req.on('end', onEnd);
+};
 
-    next();
+/**
+ * Enforce max upload size via Content-Length + byte monitor.
+ * Avoid pause→await→next without resume: that hangs multipart bodies behind
+ * reverse proxies and surfaces as HTTP 504 (common on demo/guest uploads).
+ */
+const checkUploadLimits: RequestHandler = (req, res, next) => {
+    const apply = (config: { maxSizeVal?: number; maxSizeUnit?: string }) => {
+        const maxSizeVal = config.maxSizeVal || 10;
+        const maxSizeUnit = config.maxSizeUnit || 'GB';
+        const maxBytes = getBytes(maxSizeVal, maxSizeUnit);
+        const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+            return res.status(413).json({ error: `File too large. Maximum ${maxSizeVal} ${maxSizeUnit}` });
+        }
+
+        attachUploadByteMonitor(req, res, maxBytes, maxSizeVal, maxSizeUnit);
+        next();
+    };
+
+    // Warm cache: fully synchronous — no stream pause, no proxy idle timeout.
+    if (configCache && Date.now() - configCacheTime < 10000) {
+        return apply(configCache);
+    }
+
+    // Cold cache: pause only for the brief config fetch, then resume before multer.
+    req.pause();
+    getConfig()
+        .then((config) => {
+            const maxSizeVal = config.maxSizeVal || 10;
+            const maxSizeUnit = config.maxSizeUnit || 'GB';
+            const maxBytes = getBytes(maxSizeVal, maxSizeUnit);
+            const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+
+            if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+                req.resume();
+                return res.status(413).json({ error: `File too large. Maximum ${maxSizeVal} ${maxSizeUnit}` });
+            }
+
+            attachUploadByteMonitor(req, res, maxBytes, maxSizeVal, maxSizeUnit);
+            req.resume();
+            next();
+        })
+        .catch((err) => {
+            req.resume();
+            next(err);
+        });
 };
 
 const RESERVED_SLUGS = ['api', 'admin', 'config', 's', 'r', 'login', 'reset-password'];
@@ -1324,6 +1367,7 @@ const scanFiles = async (files: Express.Multer.File[]) => {
             scanContext: 'internal',
             clamscanInstance,
             unlink: safeUnlink,
+            scanTimeoutMs: CLAMAV_TIMEOUT_MS,
         });
     }
 };
@@ -2570,14 +2614,21 @@ apiRouter.post('/config/test-email', async (req, res) => {
 
         const config = await getConfig();
         const fromAddr = smtpFromStr || smtpUserStr;
+        const appName = config.appName || 'Nexo Share';
+        const testSubject = `Test Email from ${appName}`;
+        const baseUrl = getBaseUrl(config);
+        const logoSrc = resolveEmailLogoSrc(config.logoUrl, baseUrl);
+        const html = buildEmailHtml({
+            appName,
+            subject: testSubject,
+            bodyHtml: `<p style="margin: 0 0 12px 0; color: #475569;">Your SMTP settings are correct. This message uses the same template as other Nexo Share emails.</p>`,
+            logoSrc,
+        });
         await transporter.sendMail({
-            from: fromAddr.includes('<') ? fromAddr : `"${config.appName || 'Nexo Share'}" <${fromAddr}>`,
+            from: fromAddr.includes('<') ? fromAddr : `"${appName}" <${fromAddr}>`,
             to: testEmail,
-            subject: `Test Email from ${config.appName || 'Nexo Share'}`,
-            html: `<div style="font-family: sans-serif; padding: 20px; background: #f3f4f6; border-radius: 8px;">
-                    <h2 style="color: #7c3aed; margin-top: 0;">Success! 🎉</h2>
-                    <p>Your SMTP settings are correct.</p>
-                   </div>`
+            subject: testSubject,
+            html,
         });
         res.json({ success: true });
     } catch (e: any) {
@@ -3170,13 +3221,17 @@ apiRouter.post('/shares/:id/chunk', authenticateToken, uploadLimiter, chunkUploa
         const chunkSize = parseInt(req.headers['x-chunk-size'] as string) || defaultChunkSize;
 
         const budget = uploadSessionBudget.get(id);
-        if (budget !== undefined) {
+        const countedKey = chunkBudgetKey(String(fileId), chunkIdx);
+        let countedSet = uploadSessionCountedChunks.get(id);
+        const alreadyCounted = !!countedSet?.has(countedKey);
+
+        if (budget !== undefined && !alreadyCounted) {
             const used = uploadSessionBytesUsed.get(id) || 0;
             if (used + chunkLen > budget) {
                 await safeUnlink(req.file.path);
                 return res.status(413).json({ error: 'Upload exceeds declared session size.' });
             }
-        } else if (chunkIdx === 0) {
+        } else if (budget === undefined && chunkIdx === 0) {
             const usageRes = await pool.query('SELECT COALESCE(SUM(size), 0) as total FROM files WHERE share_id = $1', [id]);
             const currentTotal = parseInt(usageRes.rows[0].total);
             if (currentTotal + chunkLen > maxBytes) {
@@ -3237,11 +3292,16 @@ apiRouter.post('/shares/:id/chunk', authenticateToken, uploadLimiter, chunkUploa
 
         await safeUnlink(req.file.path);
 
-        if (budget !== undefined) {
+        if (budget !== undefined && !alreadyCounted) {
+            if (!countedSet) {
+                countedSet = new Set<string>();
+                uploadSessionCountedChunks.set(id, countedSet);
+            }
+            countedSet.add(countedKey);
             uploadSessionBytesUsed.set(id, (uploadSessionBytesUsed.get(id) || 0) + chunkLen);
         }
 
-        res.json({ success: true, chunkIndex: chunkIdx });
+        res.json({ success: true, chunkIndex: chunkIdx, duplicate: alreadyCounted });
     } catch (e) {
         if (req.file) await safeUnlink(req.file.path);
         console.error('Chunk error:', e);
@@ -3295,6 +3355,22 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
         if (checkOwner.rows.length === 0) throw new Error('Share not found');
         if (checkOwner.rows[0].user_id !== authReq.user!.id) throw new Error('Access denied');
 
+        // Idempotent: if a prior finalize committed but the client saw 502/504, return success.
+        const existingFiles = await client.query(
+            'SELECT COUNT(*)::int AS c FROM files WHERE share_id = $1',
+            [id]
+        );
+        if ((existingFiles.rows[0]?.c || 0) >= files.length) {
+            clearUploadSessionKeys(id);
+            await unlinkTempPartFilesForShare(id);
+            return res.json({
+                success: true,
+                shareUrl: `${config.appUrl || 'http://localhost:5173'}/s/${id}`,
+                alreadyFinalized: true,
+                recipientsNotified: false
+            });
+        }
+
         const declaredTotal = files.reduce((acc: number, f: any) => acc + (Number(f.size) || 0), 0);
         const sessionBudget = uploadSessionBudget.get(id);
         if (sessionBudget !== undefined && declaredTotal > sessionBudget) {
@@ -3315,8 +3391,21 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
                 throw new Error('Security error: invalid storage path');
             }
 
+            // Scan the .part first so a timeout/failure leaves chunks retryable.
+            await scanPathWithClamav({
+                filePath: partPath,
+                displayName: f.originalName,
+                fileSizeBytes: f.size,
+                config,
+                demoMode: DEMO_MODE,
+                scanContext: 'internal',
+                clamscanInstance,
+                unlink: safeUnlink,
+                messages: SCAN_MESSAGES_FINALIZE,
+                scanTimeoutMs: CLAMAV_TIMEOUT_MS,
+            });
+
             try {
-                // Rename direct naar final destination (Instant!)
                 await fs.rename(partPath, finalPath);
                 movedStoragePaths.push(finalPath);
             } catch (e: any) {
@@ -3326,20 +3415,6 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
                 }
                 throw new Error(`Upload failed processing ${f.originalName}: ${e.message}`);
             }
-
-
-
-            await scanPathWithClamav({
-                filePath: finalPath,
-                displayName: f.originalName,
-                fileSizeBytes: f.size,
-                config,
-                demoMode: DEMO_MODE,
-                scanContext: 'internal',
-                clamscanInstance,
-                unlink: safeUnlink,
-                messages: SCAN_MESSAGES_FINALIZE,
-            });
 
             const safeOriginalName = sanitizeFilename(f.originalName);
             await client.query(`INSERT INTO files (share_id, filename, original_name, size, mime_type, storage_path) VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -3366,7 +3441,7 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
                     await pool.query(`INSERT INTO contacts (user_id, email) VALUES ($1, $2) ON CONFLICT (user_id, email) DO NOTHING`, [authReq.user!.id, email]);
                     const sent = await sendEmail(email, 'Files received',
                         `<p><strong>${escapeHtml(authReq.user!.email)}</strong> shared files with you.</p>
-                        <div class="message-box" style="background: #f3f4f6; padding: 15px; border-radius: 8px; margin: 20px 0; color: #4b5563;">
+                        <div class="message-box" style="${EMAIL_MESSAGE_BOX_STYLE}">
                         ${share.message ? escapeHtml(share.message).replace(/\n/g, '<br>') : 'No message was added.'}
                         </div>`, url, 'Download Files');
                     if (sent) recipientsNotified = true;
@@ -3384,15 +3459,21 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
 
     } catch (e: any) {
         try { await client.query('ROLLBACK'); } catch { /* noop */ }
+        const msg = e?.message || 'Finalize failed';
         if (!transactionCommitted) {
             for (const p of movedStoragePaths) {
                 await safeUnlink(p);
             }
-            await unlinkTempPartFilesForShare(id);
+            // Keep .part files on retryable scan failures so the client can finalize again.
+            if (!/timed out|try again|unavailable/i.test(msg)) {
+                await unlinkTempPartFilesForShare(id);
+            }
         }
         console.error('Finalize error:', e);
-        const status = e.message.includes('Virus') ? 400 : 500;
-        res.status(status).json({ error: e.message || 'Finalize failed' });
+        let status = 500;
+        if (/virus detected|virus in /i.test(msg)) status = 400;
+        else if (/timed out|unavailable|try again/i.test(msg)) status = 503;
+        res.status(status).json({ error: msg });
     } finally {
         client.release();
     }
@@ -3613,7 +3694,7 @@ apiRouter.post('/shares/:id/resend', authenticateToken, async (req, res) => {
         }
         // Try/Catch om crash te voorkomen bij SMTP errors
         try {
-            for (const email of list) await sendEmail(email, 'Reminder: Files received', `<p><strong>${escapeHtml(authReq.user!.email)}</strong> sent the link again.</p><div class="message-box" style="background: #f3f4f6; padding: 15px; border-radius: 8px; margin: 20px 0; color: #4b5563;">${message ? escapeHtml(message).replace(/\n/g, '<br>') : 'Here is the link.'}</div>`, shareUrl, 'Download Files');
+            for (const email of list) await sendEmail(email, 'Reminder: Files received', `<p><strong>${escapeHtml(authReq.user!.email)}</strong> sent the link again.</p><div class="message-box" style="${EMAIL_MESSAGE_BOX_STYLE}">${message ? escapeHtml(message).replace(/\n/g, '<br>') : 'Here is the link.'}</div>`, shareUrl, 'Download Files');
         } catch (e: any) {
             console.error("Resend email failed:", e.message);
             res.status(500).json({ error: e.message || 'Failed to resend email' });
@@ -3695,6 +3776,7 @@ apiRouter.post('/shares/:id/stage', authenticateToken, uploadLimiter, async (req
                 clamscanInstance,
                 unlink: safeUnlink,
                 messages: SCAN_MESSAGES_STAGED,
+                scanTimeoutMs: CLAMAV_TIMEOUT_MS,
             });
 
             stagedFiles.push({
@@ -4625,8 +4707,8 @@ apiRouter.post('/public/reverse/:id/verify', loginLimiter, async (req, res) => {
 
 // REVERSE SHARE CHUNKED UPLOAD (GUEST)
 
-// STAP 1: Init Guest Upload
-apiRouter.post('/public/reverse/:id/init', checkUploadLimits, uploadLimiter, async (req, res) => {
+// STAP 1: Init Guest Upload (JSON only — no file body; size limits apply on /chunk)
+apiRouter.post('/public/reverse/:id/init', uploadLimiter, async (req, res) => {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(400).json({ error: 'Invalid link ID format' });
     const shareRes = await pool.query('SELECT * FROM reverse_shares WHERE id = $1', [id]);
@@ -4919,6 +5001,7 @@ apiRouter.post('/public/reverse/:id/finalize', uploadLimiter, async (req, res) =
                 clamscanInstance,
                 unlink: safeUnlink,
                 messages: SCAN_MESSAGES_REVERSE,
+                scanTimeoutMs: CLAMAV_TIMEOUT_MS,
             });
 
             const dangerousTypes = ['.exe', '.bat', '.cmd', '.sh', '.php', '.pl', '.py', '.cgi', '.jar', '.msi', '.com', '.scr', '.hta'];
@@ -5328,6 +5411,21 @@ async function initDB() {
                 if (JWT_SECRET === 'dev-secret-change-me') console.error('⚠️ DEFAULT SECRET IN USE');
 
                 app.use('/api', apiRouter);
+
+                // Multer / upload errors → JSON (never opaque HTML "File too large")
+                app.use('/api', (err: any, _req: any, res: any, next: any) => {
+                    if (!err) return next();
+                    if (err.name === 'MulterError' || err.code === 'LIMIT_FILE_SIZE') {
+                        const maxLabel = DEMO_MODE ? `${DEMO_MAX_FILE_MB} MB` : 'the configured limit';
+                        if (err.code === 'LIMIT_FILE_SIZE') {
+                            return res.status(413).json({ error: `File too large. Maximum ${maxLabel}` });
+                        }
+                        return res.status(400).json({ error: err.message || 'Upload error' });
+                    }
+                    console.error('API error:', err);
+                    if (res.headersSent) return next(err);
+                    res.status(err.status || 500).json({ error: err.message || 'Server error' });
+                });
 
                 // DYNAMIC MANIFEST (PWA)
                 app.get('/site.webmanifest', async (req, res) => {

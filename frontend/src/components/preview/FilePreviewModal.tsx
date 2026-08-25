@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { motion } from 'framer-motion';
+import { motion } from 'motion/react';
 import { X, Download, FileText, ShieldAlert } from 'lucide-react';
 
 import ImagePreview from './ImagePreview';

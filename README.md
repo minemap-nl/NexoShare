@@ -89,7 +89,7 @@ Unlike many standard open-source solutions, Nexo Share focuses heavily on securi
 * **🛡️ Advanced Security**
   * Two-Factor Authentication (TOTP)
   * Passkey support (Face ID, Touch ID, Windows Hello)
-  * ClamAV virus scanning integration
+  * ClamAV virus scanning (always on for reverse shares; optional for internal shares)
 * **🔑 SSO Support** — OpenID Connect (OIDC) with optional admin groups (authoritative when set; skipped when empty).
 * **⚙️ Admin Dashboard** — Manage users, global settings, SMTP configuration, and audit logs.
 
@@ -114,7 +114,7 @@ The recommended way to install **Nexo Share** is via **Docker**.
 ```yaml
 services:
   nexoshare:
-    image: ghcr.io/minemap-nl/nexoshare:v.1.06 # or :latest
+    image: ghcr.io/minemap-nl/nexoshare:v1.06.00 # or :latest
     container_name: nexoshare
     restart: unless-stopped
     ports:
@@ -187,7 +187,7 @@ services:
 ```
 
 
-See [RELEASE_NOTES.md](./RELEASE_NOTES.md) for v.1.06 changes.
+See [RELEASE_NOTES.md](./RELEASE_NOTES.md) for v1.06 changes.
 
 4. Start the stack:
 

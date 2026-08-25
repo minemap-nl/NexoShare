@@ -13,6 +13,23 @@ export function getBackoffDelay(attempt: number): number {
     return Math.floor(exponentialDelay + jitter);
 }
 
+/** User-facing message for axios/network upload failures (incl. proxy 502/504). */
+export function getUploadErrorMessage(err: any, fallback = 'Upload failed'): string {
+    const status = err?.response?.status;
+    if (status === 504 || status === 502) {
+        return 'Upload timed out (server or proxy). Please try again.';
+    }
+    if (status === 503) {
+        return err?.response?.data?.error || 'Service temporarily unavailable. Please try again.';
+    }
+    if (status === 413) {
+        const bodyErr = err?.response?.data?.error;
+        if (typeof bodyErr === 'string' && bodyErr.trim()) return bodyErr;
+        return 'Upload rejected as too large by the server or proxy. If the file is under the app limit, check reverse-proxy body size settings.';
+    }
+    return err?.response?.data?.error || err?.message || fallback;
+}
+
 /** Crypto-veilige UUID generator voor browser */
 export function generateUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'

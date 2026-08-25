@@ -25,7 +25,25 @@ export type ScanPathParams = {
     clamscanInstance: { isInfected: (path: string) => Promise<{ isInfected: boolean; viruses?: string[] }> } | null;
     unlink: (filePath: string) => Promise<void>;
     messages?: ScanMessageOverrides;
+    /** Cap ClamAV wait so proxies don't return opaque 504s. */
+    scanTimeoutMs?: number;
 };
+
+function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(onTimeout()), ms);
+        promise.then(
+            (value) => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            (err) => {
+                clearTimeout(timer);
+                reject(err);
+            }
+        );
+    });
+}
 
 const SIZE_MULTIPLIERS: Record<string, number> = {
     KB: 1024,
@@ -83,7 +101,7 @@ function defaultMessages(): Required<ScanMessageOverrides> {
         streamLimit: (displayName, suggestedMB) =>
             `ClamAV rejected file "${displayName}": stream limit exceeded. ` +
             `Increase StreamMaxLength in clamd.conf to at least ${suggestedMB}M and restart ClamAV.`,
-        scanError: () => 'Error during virusscan. Try again later.',
+        scanError: () => 'Virus scan timed out or failed. Please try again in a moment.',
         scannerOffline: () => 'Security error: Virus scanner unavailable, upload refused.',
     };
 }
@@ -104,12 +122,15 @@ function isStreamLimitError(message: string): boolean {
 }
 
 function isPropagatedScanError(message: string): boolean {
+    // Do not treat timeout/scanError ("Virus scan timed out...") as already-finalized —
+    // those still need unlink when enforced.
+    if (/timed out/i.test(message)) return false;
     return (
-        message.includes('Virus') ||
-        message.includes('exceeds') ||
-        message.includes('virus scan limit') ||
+        message.includes('Virus detected') ||
+        message.includes('exceeds the virus scan limit') ||
         message.includes('scanner unavailable') ||
-        message.includes('virusscan')
+        message.includes('virusscan') ||
+        message.includes('Upload refused')
     );
 }
 
@@ -128,6 +149,7 @@ export async function scanPathWithClamav(params: ScanPathParams): Promise<void> 
         clamscanInstance,
         unlink,
         messages: messageOverrides,
+        scanTimeoutMs,
     } = params;
 
     if (scanContext === 'internal' && !shouldScanInternalShare(config, demoMode)) {
@@ -162,7 +184,12 @@ export async function scanPathWithClamav(params: ScanPathParams): Promise<void> 
     }
 
     try {
-        const result = await clamscanInstance.isInfected(filePath);
+        const timeoutMs = scanTimeoutMs ?? (demoMode ? 15000 : 55000);
+        const result = await withTimeout(
+            clamscanInstance.isInfected(filePath),
+            timeoutMs,
+            () => new Error(messages.scanError())
+        );
         const viruses = result.viruses ?? [];
 
         if (result.isInfected) {
@@ -208,7 +235,7 @@ export const SCAN_MESSAGES_FINALIZE: ScanMessageOverrides = {
     streamLimit: (displayName, suggestedMB) =>
         `ClamAV rejected "${displayName}": stream limit exceeded. ` +
         `Increase StreamMaxLength in clamd.conf to at least ${suggestedMB}M.`,
-    scanError: () => 'Virus scan error. Try again later.',
+    scanError: () => 'Virus scan timed out or failed. Please try again in a moment.',
     scannerOffline: () => 'Virus scanner unavailable, upload refused.',
 };
 
@@ -226,6 +253,6 @@ export const SCAN_MESSAGES_REVERSE: ScanMessageOverrides = {
         `Contact the administrator to increase the virus scan limit.`,
     streamLimit: () =>
         'Virus scanner rejected file due to size limit. Please contact the administrator.',
-    scanError: () => 'Virus scan error. Try again later.',
+    scanError: () => 'Virus scan timed out or failed. Please try again in a moment.',
     scannerOffline: () => 'Security error: Virus scanner is unavailable.',
 };

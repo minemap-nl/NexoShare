@@ -9,7 +9,7 @@ export {
 } from './events';
 export { saveUploadState, loadUploadState, clearUploadState, type UploadStatePayload } from './uploadPersistence';
 export { formatBytes, UNITS, getUnitLabel, getFutureDate } from './format';
-export { computeChunkHash, getBackoffDelay, generateUUID } from './uploadCrypto';
+export { computeChunkHash, getBackoffDelay, getUploadErrorMessage, generateUUID } from './uploadCrypto';
 export { sortFiles, synthesizeDirectoryItems } from './uploadTree';
 export { traverseFileTree, processHandle } from './uploadFs';
 export { isAllowedBrandingUrl, isValidHttpUrl } from './security';

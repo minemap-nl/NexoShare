@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
+import { listContainerVariants, listItemVariants } from '../lib/motionPresets';
 
 import { useParams } from 'react-router-dom';
 import {
@@ -34,6 +35,7 @@ import {
     getFutureDate,
     computeChunkHash,
     getBackoffDelay,
+    getUploadErrorMessage,
     generateUUID,
     isValidHttpUrl,
     sortFiles,
@@ -209,18 +211,18 @@ export function MySharesView({ active }: { active: boolean }) {
                 const chunk = file.slice(start, end);
                 
                 const chunkHash = await computeChunkHash(chunk);
-                
-                const chunkFd = new FormData();
-                chunkFd.append('chunk', chunk);
-                chunkFd.append('chunkIndex', chunkIndex.toString());
-                chunkFd.append('totalChunks', totalChunks.toString());
-                chunkFd.append('fileName', file.name);
-                chunkFd.append('fileId', fileId);
-                chunkFd.append('chunkHash', chunkHash);
 
                 let attempts = 0;
                 const maxAttempts = 10;
                 while (attempts < maxAttempts) {
+                    const chunkFd = new FormData();
+                    chunkFd.append('chunk', chunk);
+                    chunkFd.append('chunkIndex', chunkIndex.toString());
+                    chunkFd.append('totalChunks', totalChunks.toString());
+                    chunkFd.append('fileName', file.name);
+                    chunkFd.append('fileId', fileId);
+                    chunkFd.append('chunkHash', chunkHash);
+
                     try {
                         await axios.post(`${API_URL}/shares/${editing.id}/chunk`, chunkFd, {
                             headers: { 'X-Chunk-Size': CHUNK_SIZE.toString() },
@@ -284,7 +286,7 @@ export function MySharesView({ active }: { active: boolean }) {
 
         } catch (e: any) {
             console.error(e);
-            notify(e.response?.data?.error || e.message || 'Scan failed', "error");
+            notify(getUploadErrorMessage(e, 'Scan failed'), "error");
         } finally {
             setIsStaging(false);
             setEditProgress(0);
@@ -367,65 +369,80 @@ export function MySharesView({ active }: { active: boolean }) {
                 </div>
             )}
 
-            <div className="grid gap-4">
-                {shares.map(s => (
-                    <div key={s.id} className="bg-neutral-900 rounded-xl border border-neutral-800 p-4 md:p-6 flex flex-col md:flex-row justify-between items-start gap-4 hover:border-neutral-600 transition duration-300">
-                        <div className="flex-1 min-w-0">
-                            <h3 className="text-lg font-bold tracking-tight text-white md:text-xl flex items-center gap-2 flex-wrap">{s.name} {s.protected && <LockIcon className="w-4 h-4 text-yellow-500" />}</h3>
-                            <div className="text-neutral-400 text-xs md:text-sm mt-1 flex gap-2 md:gap-3 flex-wrap">
-                                <span>{s.files?.length || 0} files</span>
-                                <span>•</span>
-                                <span>{formatBytes(s.total_size)}</span>
-                                <span className="hidden sm:inline">•</span>
-                                <span>Expires on: {s.expires_at ? new Date(s.expires_at).toLocaleDateString() : 'Never'}</span>
-                                <span className="hidden sm:inline">•</span>
-                                <span className={`flex items-center gap-1 ${s.max_downloads && s.download_count >= s.max_downloads ? 'text-red-500 font-bold' : ''}`}>
-                                    <Download className="w-3 h-3" />
-                                    {s.download_count || 0}
-                                    {s.max_downloads ? ` / ${s.max_downloads}` : ''}
-                                </span>
+            <motion.div
+                className="grid gap-4"
+                variants={listContainerVariants}
+                initial="hidden"
+                animate="visible"
+            >
+                <AnimatePresence>
+                    {shares.map(s => (
+                        <motion.div
+                            key={s.id}
+                            variants={listItemVariants}
+                            initial="hidden"
+                            animate="visible"
+                            exit="exit"
+                            transition={{ duration: 0.25, ease: 'easeOut' }}
+                            className="bg-neutral-900 rounded-xl border border-neutral-800 p-4 md:p-6 flex flex-col md:flex-row justify-between items-start gap-4 hover:border-neutral-600 transition duration-300"
+                        >
+                            <div className="flex-1 min-w-0">
+                                <h3 className="text-lg font-bold tracking-tight text-white md:text-xl flex items-center gap-2 flex-wrap">{s.name} {s.protected && <LockIcon className="w-4 h-4 text-yellow-500" />}</h3>
+                                <div className="text-neutral-400 text-xs md:text-sm mt-1 flex gap-2 md:gap-3 flex-wrap">
+                                    <span>{s.files?.length || 0} files</span>
+                                    <span>•</span>
+                                    <span>{formatBytes(s.total_size)}</span>
+                                    <span className="hidden sm:inline">•</span>
+                                    <span>Expires on: {s.expires_at ? new Date(s.expires_at).toLocaleDateString() : 'Never'}</span>
+                                    <span className="hidden sm:inline">•</span>
+                                    <span className={`flex items-center gap-1 ${s.max_downloads && s.download_count >= s.max_downloads ? 'text-red-500 font-bold' : ''}`}>
+                                        <Download className="w-3 h-3" />
+                                        {s.download_count || 0}
+                                        {s.max_downloads ? ` / ${s.max_downloads}` : ''}
+                                    </span>
+                                </div>
+                                <div className="mt-3 flex flex-wrap items-center gap-2">
+                                    <CopyButton text={s.url} className="text-primary-300 hover:text-primary-200 text-sm bg-primary/10 px-2 py-1 rounded w-fit break-all text-left whitespace-normal" />
+                                    <ShareButton
+                                        variant="outbound"
+                                        compact
+                                        showLabel
+                                        url={s.url}
+                                        name={s.name}
+                                        description={s.message}
+                                        expiresAt={s.expires_at ?? null}
+                                        locale={msCfg?.appLocale}
+                                        onCopied={() => notify('Copied to clipboard', 'success')}
+                                    />
+                                </div>
                             </div>
-                            <div className="mt-3 flex flex-wrap items-center gap-2">
-                                <CopyButton text={s.url} className="text-primary-300 hover:text-primary-200 text-sm bg-primary/10 px-2 py-1 rounded w-fit break-all text-left whitespace-normal" />
-                                <ShareButton
-                                    variant="outbound"
-                                    compact
-                                    showLabel
-                                    url={s.url}
-                                    name={s.name}
-                                    description={s.message}
-                                    expiresAt={s.expires_at ?? null}
-                                    locale={msCfg?.appLocale}
-                                    onCopied={() => notify('Copied to clipboard', 'success')}
-                                />
+                            <div className="flex gap-2 flex-shrink-0 self-start">
+                                <button
+                                    onClick={() => setEditing({ ...s, newMaxDownloads: s.max_downloads ?? '' })}
+                                    className="p-2 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition"
+                                    title="Edit"
+                                >
+                                    <Edit className="w-5 h-5" />
+                                </button>
+                                <button
+                                    onClick={() => setResending(s)}
+                                    className="p-2 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition"
+                                    title="Resend email"
+                                >
+                                    <Mail className="w-5 h-5" />
+                                </button>
+                                <button
+                                    onClick={() => deleteShare(s.id)}
+                                    className="p-2 hover:bg-red-500/10 rounded text-red-500 transition"
+                                    title="Delete"
+                                >
+                                    <Trash2 className="w-5 h-5" />
+                                </button>
                             </div>
-                        </div>
-                        <div className="flex gap-2 flex-shrink-0 self-start">
-                            <button
-                                onClick={() => setEditing({ ...s, newMaxDownloads: s.max_downloads ?? '' })}
-                                className="p-2 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition"
-                                title="Edit"
-                            >
-                                <Edit className="w-5 h-5" />
-                            </button>
-                            <button
-                                onClick={() => setResending(s)}
-                                className="p-2 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition"
-                                title="Resend email"
-                            >
-                                <Mail className="w-5 h-5" />
-                            </button>
-                            <button
-                                onClick={() => deleteShare(s.id)}
-                                className="p-2 hover:bg-red-500/10 rounded text-red-500 transition"
-                                title="Delete"
-                            >
-                                <Trash2 className="w-5 h-5" />
-                            </button>
-                        </div>
-                    </div>
-                ))}
-            </div>
+                        </motion.div>
+                    ))}
+                </AnimatePresence>
+            </motion.div>
 
             <AnimatePresence>
                 {editing && (

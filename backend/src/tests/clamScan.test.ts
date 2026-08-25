@@ -154,4 +154,24 @@ describe('scanPathWithClamav', () => {
             unlink: noopUnlink,
         });
     });
+
+    test('fails closed with clear timeout when scan hangs', async () => {
+        const unlinked: string[] = [];
+        await expect(
+            scanPathWithClamav({
+                filePath: '/tmp/hang',
+                displayName: 'slow.bin',
+                fileSizeBytes: 100,
+                config: { maxScanSizeVal: 25, maxScanSizeUnit: 'MB', clamavMustScan: true, clamavScanInternalShares: true },
+                demoMode: true,
+                scanContext: 'internal',
+                clamscanInstance: {
+                    isInfected: () => new Promise(() => { /* never resolves */ }),
+                },
+                unlink: async (p) => { unlinked.push(p); },
+                scanTimeoutMs: 30,
+            })
+        ).rejects.toThrow(/timed out|try again/i);
+        expect(unlinked).toEqual(['/tmp/hang']);
+    });
 });
