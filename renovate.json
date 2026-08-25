@@ -1,0 +1,22 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "semanticCommits": "enabled",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "deps",
+  "packageRules": [
+    {
+      "description": "Automerge non-major updates after CI passes",
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchFileNames": [
+        "frontend/package.json",
+        "backend/package.json",
+        "package.json"
+      ],
+      "automerge": true,
+      "automergeType": "pr"
+    }
+  ]
+}

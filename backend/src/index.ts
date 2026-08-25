@@ -1,0 +1,5497 @@
+import express, { Request, Response, RequestHandler, NextFunction } from 'express';
+import { Pool } from 'pg';
+
+
+import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import cors from 'cors';
+import nodemailer from 'nodemailer';
+import { ZipArchive } from 'archiver';
+import crypto from 'crypto';
+import { promises as fs, type Dirent } from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+import axios from 'axios';
+import { z } from 'zod';
+import cron from 'node-cron';
+import NodeClam from 'clamscan';
+import speakeasy from 'speakeasy';
+import QRCode from 'qrcode';
+import {
+    generateRegistrationOptions,
+    verifyRegistrationResponse,
+    generateAuthenticationOptions,
+    verifyAuthenticationResponse
+} from '@simplewebauthn/server';
+import validator from 'validator';
+import rateLimit from 'express-rate-limit';
+import { isPathUnderDir, isResolvedPathInsideDir, safeUploadBaseName } from './lib/uploadPathPolicy';
+import { buildDemoForceBlockedExtensions } from './lib/blockedExtensions';
+import {
+    isClamavScanEnforced as isClamavScanEnforcedForConfig,
+    scanPathWithClamav,
+    SCAN_MESSAGES_FINALIZE,
+    SCAN_MESSAGES_REVERSE,
+    SCAN_MESSAGES_STAGED,
+} from './lib/clamScan';
+import {
+    assertUploadFileNamesAllowed,
+    checkExtension,
+    getBlockedFilenameReason,
+    getUploadBlocklist,
+} from './lib/uploadValidation';
+import { buildContentSecurityPolicy, parseExtraConnectOriginsFromEnv } from './lib/cspPolicy';
+import {
+    extractOidcGroups,
+    resolveSsoAdminFromGroups,
+    userMatchesSsoAdminGroups,
+} from './lib/ssoGroups';
+import { buildEmailHtml, resolveEmailLogoSrc, EMAIL_MESSAGE_BOX_STYLE } from './lib/emailTemplate';
+import {
+    cleanupOrphanedShareZips,
+    computeManifest,
+    getShareZipsDir,
+    invalidatePrezip,
+    schedulePrezip,
+    tryStreamPrezip,
+    type PrezipType,
+} from './lib/sharePrezip';
+
+dotenv.config();
+
+/** When true (set DEMO_MODE=true in env), aggressive data TTL, no outbound mail, and restricted account routes. */
+const DEMO_MODE = process.env.DEMO_MODE === 'true';
+const DEMO_PUBLIC_URL = process.env.DEMO_APP_URL || 'https://demo-nexoshare.famretera.nl';
+const DEMO_RETENTION_MINUTES = Math.max(1, Math.min(120, parseInt(String(process.env.DEMO_DATA_RETENTION_MINUTES || '2'), 10) || 2));
+
+/**
+ * Demo: per-share / per-upload cap equals ClamAV scan cap (nothing larger can be scanned — no bypass).
+ * Set DEMO_MAX_FILE_MB (1–512), default 25 to match typical clamd StreamMaxLength.
+ */
+const DEMO_MAX_FILE_MB = Math.max(1, Math.min(512, parseInt(String(process.env.DEMO_MAX_FILE_MB || '25'), 10) || 25));
+
+/** Demo: max local user rows (default 2: e.g. seed login + wizard-created admin). Set DEMO_MAX_USERS=1 for a single seeded account only. */
+const DEMO_MAX_USERS = Math.max(1, parseInt(String(process.env.DEMO_MAX_USERS || '2'), 10) || 2);
+
+/** ClamAV socket timeout — keep demo well under typical reverse-proxy idle limits (often 30–60s). */
+const CLAMAV_TIMEOUT_MS = DEMO_MODE
+    ? Math.max(5000, Math.min(25000, parseInt(String(process.env.CLAMAV_TIMEOUT_MS || '15000'), 10) || 15000))
+    : Math.max(10000, Math.min(120000, parseInt(String(process.env.CLAMAV_TIMEOUT_MS || '60000'), 10) || 60000));
+
+
+/** Extensions always blocked in demo (executables + loose archives; not Office Open XML). */
+const DEMO_FORCE_BLOCKED_EXTENSIONS: readonly string[] = buildDemoForceBlockedExtensions();
+
+/** Fail-closed ClamAV for API hints: true when internal or reverse scanning is enforced. */
+const isClamavScanEnforcedForApi = (config: { clamavMustScan?: boolean; clamavScanInternalShares?: boolean }) =>
+    isClamavScanEnforcedForConfig(config, DEMO_MODE, 'reverse')
+    || isClamavScanEnforcedForConfig(config, DEMO_MODE, 'internal');
+
+// Validation Schemas
+const reverseShareSchema = z.object({
+    name: z.string().max(255).optional(),
+    maxSize: z.number().positive().max(1000000000000),
+    expirationVal: z.number().nonnegative().optional(),
+    expirationUnit: z.string().optional(),
+    password: z.string().max(255).optional(),
+    notify: z.boolean(),
+    sendEmailTo: z.string().max(2000).optional().or(z.literal('')),
+    thankYouMessage: z.string().max(1000).optional(),
+    customSlug: z.string().max(50).optional()
+});
+
+const shareCreateSchema = z.object({
+    name: z.string().max(255).optional(),
+    password: z.string().max(255).optional(),
+    expiration: z.string().regex(/^\d+$/, 'Expiration must be a number').optional(),
+    recipients: z.string().max(2000).optional(),
+    message: z.string().max(5000).optional(),
+    customSlug: z.string().max(50).optional()
+});
+
+const userCreateSchema = z.object({
+    email: z.string().email('Invalid email address').max(255),
+    password: z.string().min(8, 'Password must be at least 8 characters').max(128),
+    name: z.string().min(1, 'Name is required').max(255),
+    is_admin: z.boolean()
+});
+
+// --- Helper: Bepaal de publieke URL ---
+const getBaseUrl = (config: any, req?: Request): string => {
+    // Vertrouw NOOIT de Origin header voor het genereren van emails/links.
+    // 1. Gebruik altijd de geconfigureerde URL indien beschikbaar.
+    if (config.appUrl && config.appUrl.trim() !== '') {
+        return config.appUrl.replace(/\/$/, '');
+    }
+
+    // 2. Fallback: Gebruik de Host header (veiliger dan Origin, mits achter een goede proxy).
+    // We gebruiken req.protocol en req.get('host') wat standaard Express gedrag is.
+    if (req) {
+        const protocol = req.protocol;
+        const host = req.get('host');
+        return `${protocol}://${host}`;
+    }
+
+    return 'http://localhost:3000'; // Veilige fallback als alles faalt
+};
+
+// --- Types ---
+interface JWTPayload { id: number; email: string; isAdmin: boolean; }
+interface AuthRequest extends Request { user?: JWTPayload; uploadId?: string; }
+
+// --- Config Defaults ---
+const app = express();
+app.disable('x-powered-by'); // Security: Hide Express
+const PORT = parseInt(process.env.PORT || '3001');
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './uploads');
+const TEMP_DIR = path.join(UPLOAD_DIR, 'temp');
+const SYSTEM_DIR = path.join(UPLOAD_DIR, 'system'); // Veilige map voor systeem assets
+const SHARE_ZIPS_DIR = getShareZipsDir(UPLOAD_DIR);
+
+// Zorg dat mappen bestaan
+fs.mkdir(TEMP_DIR, { recursive: true }).catch(() => { });
+fs.mkdir(SYSTEM_DIR, { recursive: true }).catch(() => { });
+fs.mkdir(SHARE_ZIPS_DIR, { recursive: true }).catch(() => { });
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET === 'dev-secret-change-me') {
+    console.error('❌ CRITICAL: JWT_SECRET must be set in environment variables!');
+    console.error('Generate one with: node -e "console.log(require(\'crypto\').randomBytes(64).toString(\'hex\'))"');
+    process.exit(1);
+}
+
+fs.mkdir(TEMP_DIR, { recursive: true }).catch(() => { });
+
+const pool = new Pool({
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432'),
+    database: process.env.DB_NAME || 'Nexo Share',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+    // Verhoogd voor grote upload operaties (chunk merge kan lang duren bij 6GB+ bestanden)
+    query_timeout: 300000,     // 5 minuten
+    statement_timeout: 300000, // 5 minuten
+    ssl: process.env.DB_SSL === 'true' ? {
+        rejectUnauthorized: false
+    } : false
+});
+
+// Error handling voor database pool
+pool.on('error', (err) => {
+    console.error('⚠️ Onverwachte database pool error:', err);
+});
+
+const CLAMAV_HOST = process.env.CLAMAV_HOST || 'clamav';
+const CLAMAV_PORT = parseInt(process.env.CLAMAV_PORT || '3310');
+
+// --- CENTRAL DOMAIN CONFIGURATION ---
+// "Keep it simple and logical" - 1 variabele (APP_URL) stuurt de defaults aan.
+const APP_URL = process.env.APP_URL || 'http://localhost:3000';
+// Haal de hostname (domein) uit de URL (bijv. 'share.mijnwebsite.nl')
+let APP_DOMAIN = 'localhost';
+try { APP_DOMAIN = new URL(APP_URL).hostname; } catch (e) { console.warn('Invalid APP_URL, fallback to localhost'); }
+
+// WebAuthn Configuration
+const RP_NAME = 'Nexo Share';
+// RP_ID is het domein waarop passkeys geldig zijn (geen poort/protocol)
+const RP_ID = process.env.RP_ID || APP_DOMAIN;
+// ORIGIN is de volledige URL waarvandaan het verzoek komt (voor verificatie)
+// Fallback naar web-port 3000 voor dev, maar in prod is dit vaak gelijk aan APP_URL
+const ORIGIN = process.env.ORIGIN || 'http://localhost:3000';
+
+let clamscanInstance: any = null;
+
+new NodeClam().init({
+    removeInfected: true,
+    quarantineInfected: false,
+    debugMode: false,
+    clamdscan: {
+        host: CLAMAV_HOST,
+        port: CLAMAV_PORT,
+        timeout: CLAMAV_TIMEOUT_MS,
+        active: true
+    },
+    preference: 'clamdscan'
+}).then((instance: any) => {
+    clamscanInstance = instance;
+    console.log(`✅ ClamAV is active and connected (timeout ${CLAMAV_TIMEOUT_MS}ms).`);
+}).catch((err: any) => {
+    console.warn("⚠️ ClamAV is not found or can't connect:", err.message);
+    console.warn("   Virusscanning is turned off.");
+});
+
+const isPrivateIP = (host: string | any) => {
+    if (!host || typeof host !== 'string') return true;
+    // 0. Blokkeer vreemde formaten (Hex, Octal, Integer IPs)
+    if (!/^[a-zA-Z0-9.:-]+$/.test(host)) return true;
+
+    // 1. Blokkeer Cloud Metadata Services (Kritiek voor AWS/Azure/GCP)
+    if (host === '169.254.169.254') return true;
+    if (host.toLowerCase().startsWith('fe80:')) return true;
+    if (host.toLowerCase().includes('fd00:ec2')) return true;
+
+    // 2. Localhost & Standaard Private Ranges
+    if (host === 'localhost') return true;
+    if (host === '0.0.0.0') return true;
+    if (host === '::1') return true; // IPv6 localhost
+    if (host === '::') return true;
+
+    // IPv4 Private Ranges
+    if (host.startsWith('127.')) return true;
+    if (host.startsWith('10.')) return true;
+    if (host.startsWith('192.168.')) return true;
+    if (host.startsWith('169.254.')) return true; // Link-local IPv4
+
+    // Class B (172.16.0.0 - 172.31.255.255)
+    if (host.startsWith('172.')) {
+        const parts = host.split('.');
+        if (parts.length > 1) {
+            const second = parseInt(parts[1], 10);
+            if (second >= 16 && second <= 31) return true;
+        }
+    }
+
+    // IPv6 Private Ranges (Unique Local Address)
+    if (host.toLowerCase().startsWith('fc') || host.toLowerCase().startsWith('fd')) return true;
+
+    return false;
+};
+
+// --- Cronjob (Idee 1) ---
+// Draait elk uur op minuut 0 om verlopen shares op te ruimen
+cron.schedule('0 * * * *', async () => {
+    console.log('🧹 Start automatische opruiming...');
+    const client = await pool.connect();
+    try {
+        // 1. Zoek verlopen shares
+        const res = await client.query(`SELECT id FROM shares WHERE expires_at IS NOT NULL AND expires_at < NOW()`);
+
+        for (const row of res.rows) {
+            const sharePath = path.join(UPLOAD_DIR, row.id);
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', row.id);
+            // Verwijder fysieke map
+            await fs.rm(sharePath, { recursive: true, force: true }).catch(() => { });
+            console.log(`Expired share deleted from disk: ${row.id}`);
+        }
+
+        // 2. Verwijder uit database (Cascade verwijdert ook de file-records)
+        await client.query(`DELETE FROM shares WHERE expires_at IS NOT NULL AND expires_at < NOW()`);
+
+        // 3. Reverse shares are explicitly NOT deleted by cron so they only stop accepting uploads.
+
+
+        // 4. Cleanup sso tokens
+        await pool.query('DELETE FROM sso_tokens WHERE expires_at < NOW()');
+
+        // 5. Cleanup oude audit logs (ouder dan 1 jaar bewaren is meestal genoeg)
+        await pool.query("DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '1 year'");
+
+        // 6. Cleanup Orphaned Files (Disk vs DB sync)
+        await cleanupOrphanedFolders();
+        await cleanupOrphanedGuestFiles();
+        await cleanupOrphanedShareFiles();
+        await cleanupOrphanedShareZips(pool, SHARE_ZIPS_DIR);
+
+        console.log('✅ Opruiming voltooid.');
+    } catch (e) {
+        console.error('❌ Fout bij opruiming:', e);
+    } finally {
+        client.release();
+    }
+});
+
+const cleanupOrphanedFolders = async () => {
+    console.log('🧹 Start controle op wees-mappen...');
+    try {
+        // 1. Haal alle mapnamen op uit de uploads folder
+        const dirents = await fs.readdir(UPLOAD_DIR, { withFileTypes: true });
+        const folders = dirents
+            // VOEG HIER JE MAP TOE AAN DE UITZONDERINGEN:
+            .filter(dirent =>
+                dirent.isDirectory() &&
+                dirent.name !== 'temp' &&
+                dirent.name !== 'guest_uploads' &&
+                dirent.name !== 'system' &&
+                dirent.name !== 'share_zips'
+            )
+            .map(dirent => dirent.name);
+
+        if (folders.length === 0) return;
+
+        // 2. Haal alle actieve share ID's op uit de database
+        const dbResult = await pool.query('SELECT id FROM shares');
+        const activeIds = new Set(dbResult.rows.map(row => row.id));
+
+        // 3. Vergelijk en verwijder mappen die niet in de DB staan
+        for (const folderId of folders) {
+            // Check of het een geldig ID formaat is (om systeemmappen te sparen)
+            // Aanname: ID's zijn hex strings of slugs. Pas regex aan indien nodig.
+            if (!activeIds.has(folderId)) {
+                console.log(`🗑️ Wees-map gevonden en verwijderd: ${folderId}`);
+                await fs.rm(path.join(UPLOAD_DIR, folderId), { recursive: true, force: true });
+            }
+        }
+    } catch (e) {
+        console.error('❌ Fout bij orphan cleanup:', e);
+    }
+};
+
+// Voeg deze functie toe bij de andere helpers (bijv. onder cleanupOrphanedFolders)
+const cleanupOrphanedGuestFiles = async () => {
+    console.log('🧹 Start checking for orphan files in guest_uploads...');
+    const guestDir = path.join(UPLOAD_DIR, 'guest_uploads');
+    try {
+        // Check of map bestaat
+        await fs.access(guestDir);
+
+        const filesOnDisk = await fs.readdir(guestDir);
+        if (filesOnDisk.length === 0) return;
+
+        // Haal alle bekende paden op uit de DB die in guest_uploads staan
+        // We zoeken op storage_path die 'guest_uploads' bevatten
+        const dbResult = await pool.query("SELECT storage_path FROM files WHERE storage_path LIKE '%guest_uploads%'");
+
+        // Maak een Set van bestandsnamen (alleen de bestandsnaam, niet het hele pad)
+        const knownFiles = new Set(dbResult.rows.map(row => path.basename(row.storage_path)));
+
+        let cleaned = 0;
+        for (const file of filesOnDisk) {
+            // Als bestand op schijf staat, maar NIET in de DB
+            if (!knownFiles.has(file)) {
+                const filePath = path.join(guestDir, file);
+                try {
+                    const stats = await fs.stat(filePath);
+                    // Check leeftijd (1 uur) om race conditions te voorkomen
+                    if (Date.now() - stats.mtimeMs > 3600000) {
+                        await fs.unlink(filePath).catch(() => { });
+                        cleaned++;
+                    }
+                } catch (e) { }
+            }
+        }
+        if (cleaned > 0) console.log(`🗑️ ${cleaned} orphaned guest files removed.`);
+    } catch (e) {
+        // Map bestaat misschien niet of andere error, geen ramp
+    }
+};
+
+const cleanupOrphanedShareFiles = async () => {
+    // Deze functie scant actieve share mappen op bestanden die niet in de DB staan
+    console.log('🧹 Start checking for orphan files in shares...');
+    try {
+        const shareDirs = (await fs.readdir(UPLOAD_DIR, { withFileTypes: true }))
+            .filter(dirent => dirent.isDirectory() && !['temp', 'system', 'guest_uploads'].includes(dirent.name))
+            .map(dirent => dirent.name);
+
+        for (const shareId of shareDirs) {
+            const dirPath = path.join(UPLOAD_DIR, shareId);
+            const filesOnDisk = await fs.readdir(dirPath);
+            if (filesOnDisk.length === 0) continue;
+
+            // Haal bekende bestanden voor deze share op uit DB
+            const dbRes = await pool.query('SELECT storage_path FROM files WHERE share_id = $1', [shareId]);
+            const knownFiles = new Set(dbRes.rows.map(row => path.basename(row.storage_path)));
+
+            for (const file of filesOnDisk) {
+                if (!knownFiles.has(file)) {
+                    const filePath = path.join(dirPath, file);
+                    try {
+                        const stats = await fs.stat(filePath);
+                        // Alleen verwijderen als ouder dan 1 uur (zodat we geen actieve uploads killen)
+                        if (Date.now() - stats.mtimeMs > 3600000) {
+                            await fs.unlink(filePath).catch(() => { });
+                            console.log(`🗑️ Wees-bestand verwijderd uit share ${shareId}: ${file}`);
+                        }
+                    } catch (e) { }
+                }
+            }
+        }
+    } catch (e) {
+        console.error('Fout bij share file cleanup:', e);
+    }
+};
+
+/** Verwijdert alleen platte bestanden ouder dan maxAge ms; onder TEMP_DIR/chunks/ recursief (legacy hash-kopieën). */
+const cleanupStaleTempFiles = async (dir: string, now: number, maxAge: number, recurseChunks: boolean): Promise<number> => {
+    let removed = 0;
+    let entries: Dirent[];
+    try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+        return 0;
+    }
+    for (const ent of entries) {
+        const filePath = path.join(dir, ent.name);
+        try {
+            if (ent.isDirectory()) {
+                if (recurseChunks && ent.name === 'chunks') {
+                    removed += await cleanupStaleTempFiles(filePath, now, maxAge, false);
+                }
+                continue;
+            }
+            const stats = await fs.stat(filePath);
+            if (now - stats.mtimeMs > maxAge) {
+                await fs.unlink(filePath);
+                removed++;
+            }
+        } catch {
+            /* weg of locked */
+        }
+    }
+    return removed;
+};
+
+// Cleanup tijdelijke bestanden: Elke 15 Minutes draaien
+cron.schedule('*/15 * * * *', async () => {
+    console.log('🧹 Start cleaning up temporary files...');
+    try {
+        const now = Date.now();
+        const maxAge = 30 * 60 * 1000;
+        const deletedCount = await cleanupStaleTempFiles(TEMP_DIR, now, maxAge, true);
+        console.log(`✅ Temp cleanup finished. ${deletedCount} files removed.`);
+    } catch (e) {
+        console.error('❌ Fout bij temp cleanup:', e);
+    }
+});
+
+// Proxy trust voor Secure Cookies & Rate Limiting achter Synology/Nginx
+app.set('trust proxy', 1);
+
+// CORS Configuration
+// We staan standaard de APP_URL toe, plus localhost voor dev.
+const ALLOWED_ORIGINS = [APP_URL, ...(process.env.ALLOWED_ORIGINS || '').split(',')].map(o => o.trim()).filter(Boolean);
+
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (mobile apps, Postman, etc.)
+        if (!origin) return callback(null, true);
+
+        if (ALLOWED_ORIGINS.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.warn(`CORS blocked origin: ${origin}`);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Chunk-Size', 'X-Preview-Stream', 'Accept']
+}));
+// --- SECURITY HEADERS MIDDLEWARE ---
+app.use(async (req, res, next) => {
+    // 1. HSTS (HTTP Strict Transport Security)
+    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    if (process.env.NODE_ENV === 'production' && isSecure) {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+
+    try {
+        const config = await getConfig();
+        res.setHeader(
+            'Content-Security-Policy',
+            buildContentSecurityPolicy({
+                brandingUrls: [config.logoUrl, config.faviconUrl, config.ssoLogoutUrl],
+                oidcIssuer: config.ssoEnabled ? config.oidcIssuer : undefined,
+                extraConnectOrigins: parseExtraConnectOriginsFromEnv(process.env.CSP_EXTRA_CONNECT_ORIGINS),
+            })
+        );
+    } catch {
+        res.setHeader(
+            'Content-Security-Policy',
+            buildContentSecurityPolicy({
+                extraConnectOrigins: parseExtraConnectOriginsFromEnv(process.env.CSP_EXTRA_CONNECT_ORIGINS),
+            })
+        );
+    }
+
+    next();
+});
+app.use(express.json({ limit: '2mb' }));
+// Publiek internet: JSON-body limiet tegen grote JSON-DoS; CORS staat requests zonder Origin toe (o.a. mobile/native tools).
+// Overweeg voor strikt alleen-web: origin null/undefined weigeren, en trust proxy alleen als je reverse proxy correct configureert.
+
+// --- Security: Simple In-Memory Rate Limiter ---
+const createRateLimiter = (windowMs: number, max: number, message: string) => {
+    const requests = new Map<string, number[]>();
+
+    // Cleanup met beter interval management
+    const cleanupInterval = setInterval(() => {
+        const now = Date.now();
+        const cutoff = now - windowMs;
+
+        for (const [ip, timestamps] of requests.entries()) {
+            const valid = timestamps.filter(t => t > cutoff);
+            if (valid.length === 0) {
+                requests.delete(ip);
+            } else {
+                requests.set(ip, valid);
+            }
+        }
+    }, Math.min(windowMs, 60000)); // Max 1 minuut interval voor efficiency
+
+    // Cleanup bij process shutdown
+    process.on('SIGTERM', () => clearInterval(cleanupInterval));
+    process.on('SIGINT', () => clearInterval(cleanupInterval)); // Cleanup interval gelijk aan window
+
+    return (req: Request, res: Response, next: NextFunction) => {
+        // Skip rate limiting for HEAD requests (used for PDF preview)
+        if (req.method === 'HEAD') return next();
+        
+        const ip = getClientIP(req);
+        const now = Date.now();
+
+        let timestamps = requests.get(ip) || [];
+        timestamps = timestamps.filter(t => t > now - windowMs);
+
+        if (timestamps.length >= max) {
+            return res.status(429).json({ error: message });
+        }
+
+        timestamps.push(now);
+        requests.set(ip, timestamps);
+        next();
+    };
+};
+
+// Initialiseer limiters
+const loginLimiter = createRateLimiter(15 * 60 * 1000, 5, "Too many login attempts. Please try again in 15 minutes.");
+const passwordResetLimiter = createRateLimiter(60 * 60 * 1000, 3, "Too many reset requests. Please try again in 1 hour.");
+// Verhoogd naar 10.000 om grote bestanden (veel chunks) toe te staan. 10.000 chunks * 50MB = 500GB max per uur.
+const uploadLimiter = createRateLimiter(60 * 60 * 1000, 10000, "Upload request limit reached for this IP.");
+const downloadLimiter = createRateLimiter(60 * 60 * 1000, 100, "Too many downloads. Please try again later.");
+
+// --- Utility Functions ---
+
+// Simple Async Queue om CPU spikes door ZIPs te voorkomen
+class AsyncQueue {
+    private running = 0;
+    private queue: Array<(value: unknown) => void> = [];
+    constructor(private maxConcurrent: number) { }
+
+    async wait(): Promise<void> {
+        if (this.running >= this.maxConcurrent) {
+            await new Promise(resolve => this.queue.push(resolve));
+        }
+        this.running++;
+    }
+
+    release(): void {
+        this.running--;
+        if (this.queue.length > 0) {
+            const next = this.queue.shift();
+            if (next) next(null);
+        }
+    }
+}
+// Maximaal 2 gelijktijdige zips genereren
+const zipQueue = new AsyncQueue(10);
+
+const sanitizeFilename = (name: string) => {
+    if (!name) return 'unnamed_file';
+
+    // 1. Neutralize directory traversal attempts
+    let safe = name.replace(/\.\./g, '__');
+
+    // 2. Remove leading slashes to force relative paths
+    safe = safe.replace(/^\/+/, '');
+
+    // 3. Prevent reserved names (Windows) - check the first segment
+    const firstSegment = safe.split('/')[0].split('.')[0];
+    if (/^(con|prn|aux|nul|com\d|lpt\d)$/i.test(firstSegment)) {
+        safe = '_' + safe;
+    }
+
+    // 4. Allow standard chars + forward slash (/)
+    return safe.replace(/[^a-zA-Z0-9._\-\s\(\)\/]/g, '_');
+};
+
+const formatBytes = (bytes: number, decimals = 2) => {
+    if (!bytes || bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+};
+
+const getTimeInMs = (val: number, unit: string) => {
+    const u = (typeof unit === 'string') ? unit.toLowerCase() : 'days';
+    const map: any = {
+        'minute': 60000, 'minutes': 60000,
+        'hour': 3600000, 'hours': 3600000,
+        'day': 86400000, 'days': 86400000,
+        'week': 604800000, 'weeks': 604800000,
+        'month': 2592000000, 'months': 2592000000,
+        'year': 31536000000, 'years': 31536000000
+    };
+    return val * (map[u] || 86400000);
+};
+
+const getBytes = (val: number, unit: string) => {
+    const k = 1024;
+    const map: any = { 'B': 1, 'KB': k, 'KiB': 1024, 'MB': k * k, 'MiB': 1024 * 1024, 'GB': k * k * k, 'GiB': 1024 * 1024 * 1024, 'TB': k * k * k * k, 'TiB': 1024 * 1024 * 1024 * 1024 };
+    return val * (map[unit] || k * k * k);
+};
+
+/** Hard limits and risky flags for public demo (called from getConfig and PUT /config). */
+function applyDemoSecurityPolicy(config: any): void {
+    if (!DEMO_MODE) return;
+    config.maxScanSizeVal = DEMO_MAX_FILE_MB;
+    config.maxScanSizeUnit = 'MB';
+    config.maxSizeVal = DEMO_MAX_FILE_MB;
+    config.maxSizeUnit = 'MB';
+    config.clamavMustScan = true;
+    config.clamavScanInternalShares = true;
+    config.ssoEnabled = false;
+    config.ssoAutoRedirect = false;
+    config.smtpAllowLocal = false;
+    config.allowPasswordReset = false;
+    const mergeBlocked = (existing: string[] | undefined) => {
+        const merged = new Set<string>();
+        for (const ext of DEMO_FORCE_BLOCKED_EXTENSIONS) merged.add(ext);
+        for (const ext of existing || []) {
+            if (typeof ext === 'string' && ext.length > 0) merged.add(ext.toLowerCase());
+        }
+        return Array.from(merged);
+    };
+    config.blockedExtensionsUser = mergeBlocked(config.blockedExtensionsUser);
+    config.blockedExtensionsGuest = mergeBlocked(config.blockedExtensionsGuest);
+}
+
+// --- Security Helpers ---
+
+// Safe Unlink: Prevents deleting files outside allowed directories
+const safeUnlink = async (filePath: string) => {
+    try {
+        const resolved = path.resolve(filePath);
+        const allowUpload = path.resolve(UPLOAD_DIR);
+        const allowTemp = path.resolve(TEMP_DIR);
+
+        // Ensure path is within allowed dirs
+        if (!resolved.startsWith(allowUpload) && !resolved.startsWith(allowTemp)) {
+            console.error(`Blocked unsafe unlink: ${resolved}`);
+            return;
+        }
+        await fs.unlink(resolved).catch(() => { });
+    } catch (e) {
+        // Ignore errors if file doesn't exist or other issues
+    }
+};
+
+/** Declared total bytes for this upload session (POST /shares/init). */
+const uploadSessionBudget = new Map<string, number>();
+/** Cumulative raw bytes received in chunk POST bodies for this share. */
+const uploadSessionBytesUsed = new Map<string, number>();
+/**
+ * Chunk keys (`shareId:fileId:chunkIndex`) already counted toward session budget.
+ * Prevents double-counting when a proxy returns 502/504 after the server already
+ * accepted the chunk and the client retries the same chunk.
+ */
+const uploadSessionCountedChunks = new Map<string, Set<string>>();
+
+const chunkBudgetKey = (fileId: string, chunkIndex: number) => `${fileId}:${chunkIndex}`;
+
+const clearUploadSessionKeys = (shareId: string) => {
+    uploadSessionBudget.delete(shareId);
+    uploadSessionBytesUsed.delete(shareId);
+    uploadSessionCountedChunks.delete(shareId);
+};
+
+/** Verwijdert tijdelijke `shareId_*_*.part` bestanden in TEMP_DIR. */
+const unlinkTempPartFilesForShare = async (shareId: string) => {
+    try {
+        const dir = await fs.readdir(TEMP_DIR);
+        const prefix = `${shareId}_`;
+        for (const name of dir) {
+            if (name.startsWith(prefix) && name.endsWith('.part')) {
+                await safeUnlink(path.join(TEMP_DIR, name));
+            }
+        }
+    } catch { /* noop */ }
+};
+
+/** Verwijdert tijdelijke `rev_<reverseShareId>_*.part` bestanden in TEMP_DIR. */
+const unlinkTempPartFilesForReverseShare = async (reverseShareId: string) => {
+    try {
+        const dir = await fs.readdir(TEMP_DIR);
+        const prefix = `rev_${reverseShareId}_`;
+        for (const name of dir) {
+            if (name.startsWith(prefix) && name.endsWith('.part')) {
+                await safeUnlink(path.join(TEMP_DIR, name));
+            }
+        }
+    } catch { /* noop */ }
+};
+
+/** Share chunked uploads use TEMP_DIR part files `<shareId>_...part` (not `rev_...`). */
+const getShareIdsWithOpenPartFiles = async (): Promise<Set<string>> => {
+    const ids = new Set<string>();
+    try {
+        const dir = await fs.readdir(TEMP_DIR);
+        for (const name of dir) {
+            if (!name.endsWith('.part') || name.startsWith('rev_')) continue;
+            const idx = name.indexOf('_');
+            if (idx > 0) ids.add(name.slice(0, idx));
+        }
+    } catch { /* noop */ }
+    return ids;
+};
+
+/** Reverse guest chunked uploads use TEMP_DIR files named `rev_<reverseShareId>_...part`. */
+const getReverseShareIdsWithOpenGuestParts = async (): Promise<Set<string>> => {
+    const ids = new Set<string>();
+    try {
+        const dir = await fs.readdir(TEMP_DIR);
+        for (const name of dir) {
+            if (!name.startsWith('rev_') || !name.endsWith('.part')) continue;
+            const rest = name.slice(4);
+            const id = rest.split('_')[0];
+            if (id) ids.add(id);
+        }
+    } catch { /* noop */ }
+    return ids;
+};
+
+if (DEMO_MODE) {
+    cron.schedule('*/5 * * * *', async () => {
+        const activeShareSessions = new Set<string>([
+            ...uploadSessionBudget.keys(),
+            ...uploadSessionBytesUsed.keys(),
+            ...uploadSessionCountedChunks.keys(),
+            ...(await getShareIdsWithOpenPartFiles())
+        ]);
+        const reverseWithParts = await getReverseShareIdsWithOpenGuestParts();
+        console.log(`[DEMO] Cleanup: removing data older than ${DEMO_RETENTION_MINUTES} minutes (skipping active upload sessions)...`);
+        const client = await pool.connect();
+        try {
+            const res = await client.query(
+                `SELECT id FROM shares WHERE created_at < NOW() - ($1::text || ' minutes')::INTERVAL`,
+                [String(DEMO_RETENTION_MINUTES)]
+            );
+            const resReverse = await client.query(
+                `SELECT id FROM reverse_shares WHERE created_at < NOW() - ($1::text || ' minutes')::INTERVAL`,
+                [String(DEMO_RETENTION_MINUTES)]
+            );
+
+            const deleteFolder = async (id: string) => {
+                const sharePath = path.join(UPLOAD_DIR, id);
+                await fs.rm(sharePath, { recursive: true, force: true }).catch(() => { });
+            };
+
+            for (const row of res.rows) {
+                if (activeShareSessions.has(row.id)) continue;
+                await deleteFolder(row.id);
+            }
+            for (const row of resReverse.rows) {
+                if (reverseWithParts.has(row.id)) continue;
+                await deleteFolder(row.id);
+            }
+
+            const skipShareIds = Array.from(activeShareSessions);
+            const skipReverseIds = Array.from(reverseWithParts);
+            await client.query(
+                `DELETE FROM shares WHERE created_at < NOW() - ($1::text || ' minutes')::INTERVAL AND NOT (id = ANY($2::text[]))`,
+                [String(DEMO_RETENTION_MINUTES), skipShareIds]
+            );
+            await client.query(
+                `DELETE FROM reverse_shares WHERE created_at < NOW() - ($1::text || ' minutes')::INTERVAL AND NOT (id = ANY($2::text[]))`,
+                [String(DEMO_RETENTION_MINUTES), skipReverseIds]
+            );
+
+            const guestRes = await client.query(
+                `SELECT id, storage_path FROM files 
+                 WHERE created_at < NOW() - ($1::text || ' minutes')::INTERVAL 
+                 AND share_id IS NULL AND reverse_share_id IS NULL`,
+                [String(DEMO_RETENTION_MINUTES)]
+            );
+            for (const f of guestRes.rows) {
+                await fs.unlink(f.storage_path).catch(() => { });
+                await client.query('DELETE FROM files WHERE id = $1', [f.id]);
+            }
+
+            await pool.query(
+                "DELETE FROM sso_tokens WHERE created_at < NOW() - ($1::text || ' minutes')::INTERVAL",
+                [String(DEMO_RETENTION_MINUTES)]
+            );
+
+            console.log('[DEMO] Cleanup finished.');
+        } catch (e) {
+            console.error('[DEMO] Cleanup error:', e);
+        } finally {
+            client.release();
+        }
+    });
+}
+
+// --- Global Cache Variables ---
+let configCache: any = null;
+let configCacheTime = 0;
+
+function invalidateConfigCache() {
+    configCache = null;
+    configCacheTime = 0;
+}
+
+async function getConfig() {
+    // Return cache als deze jonger is dan 10 Seconds (10000ms)
+    if (configCache && Date.now() - configCacheTime < 10000) {
+        return configCache;
+    }
+
+    try {
+        const res = await pool.query('SELECT data, setup_completed FROM config WHERE id = 1');
+
+        const defaults = {
+            appName: 'Nexo Share',
+            appUrl: APP_URL, // Gebruikt nu de ENV variabele als default (indien DB leeg is)
+            sessionVal: 7, sessionUnit: 'Days',
+            secureCookies: false,
+            shareIdLength: 12,
+            maxSizeVal: 10, maxSizeUnit: 'GB',
+            defaultExpirationVal: 1, defaultExpirationUnit: 'Weeks',
+            maxExpirationVal: 0, maxExpirationUnit: 'Months',
+            zipLevel: 5, zipNoMedia: true,
+            blockedExtensionsUser: [],
+            blockedExtensionsGuest: ['.exe', '.bat', '.cmd', '.sh', '.ps1', '.vbs', '.php', '.php3', '.php4', '.phtml', '.pl', '.py', '.cgi', '.jsp', '.asp', '.aspx', '.jar', '.msi', '.com', '.scr', '.hta', '.app', '.dmg', '.pkg'],
+            smtpSecure: true, smtpStartTls: false,
+            smtpAllowLocal: false,
+            ssoAutoRedirect: false,
+            ssoLogoutUrl: '',
+            faviconUrl: '',
+            require2FA: false,
+            allowPasskeys: true,
+            allowPasswordReset: true,
+            maxScanSizeVal: 25, maxScanSizeUnit: 'MB',  // ClamAV default StreamMaxLength
+            clamavScanInternalShares: false,
+            ssoAdminGroups: [] as string[],
+            appLocale: process.env.APP_LOCALE || 'en-GB',
+            serverTimezone: process.env.TZ || 'UTC'
+        };
+
+        let finalConfig: any = defaults;
+
+        // Check if DB has data
+        if (res && res.rows && res.rows.length > 0) {
+            finalConfig = {
+                ...defaults,
+                ...(res.rows[0].data || {}),
+                setupCompleted: res.rows[0].setup_completed || false
+            };
+        }
+
+        if (DEMO_MODE) {
+            let demoUserCount = 0;
+            try {
+                const ur = await pool.query('SELECT COUNT(*)::int AS c FROM users');
+                demoUserCount = ur.rows[0]?.c ?? 0;
+            } catch {
+                demoUserCount = 0;
+            }
+            finalConfig = {
+                ...finalConfig,
+                appName: finalConfig.appName || 'Nexo Share Demo',
+                appUrl: DEMO_PUBLIC_URL,
+                sessionVal: 1,
+                sessionUnit: 'Hours',
+                secureCookies: true,
+                // Keep share expiry aligned with hard cleanup TTL so demos can upload → download reliably.
+                defaultExpirationVal: DEMO_RETENTION_MINUTES,
+                defaultExpirationUnit: 'Minutes',
+                maxExpirationVal: DEMO_RETENTION_MINUTES,
+                maxExpirationUnit: 'Minutes',
+                /**
+                 * No users: force incomplete setup. With users: follow DB `setup_completed` so a seeded
+                 * placeholder (e.g. admin@nexoshare.nl) can still run the wizard while setup_completed is false.
+                 */
+                setupCompleted: demoUserCount === 0 ? false : !!finalConfig.setupCompleted,
+                smtpHost: '',
+                smtpPort: 0,
+                smtpUser: '',
+                smtpPass: '',
+                demoMode: true,
+                demoDataRetentionMinutes: DEMO_RETENTION_MINUTES
+            };
+            applyDemoSecurityPolicy(finalConfig);
+        }
+
+        // Update Cache
+        configCache = finalConfig;
+        configCacheTime = Date.now();
+
+        return finalConfig;
+    } catch (e) {
+        console.error("GetConfig Error:", e);
+        throw e;
+    }
+}
+
+const generateSecureId = async () => {
+    const config = await getConfig();
+    const len = Math.max(8, parseInt(config.shareIdLength) || 12);
+    return crypto.randomBytes(Math.ceil(len / 2)).toString('hex').slice(0, len);
+};
+
+const triggerPrezip = async (type: PrezipType, id: string) => {
+    const cfg = await getConfig();
+    schedulePrezip(pool, SHARE_ZIPS_DIR, type, id, {
+        zipLevel: cfg.zipLevel,
+        zipNoMedia: cfg.zipNoMedia,
+    });
+};
+
+const escapeHtml = (unsafe: string | any) => {
+    if (!unsafe || typeof unsafe !== 'string') return "";
+    return unsafe.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+};
+
+const sanitizeEmailHeader = (input: string): string => {
+    if (!input) return "";
+    // Verwijder newlines, carriage returns en null bytes (Email Header Injection preventie)
+    return input.replace(/[\r\n\0]/g, '').substring(0, 200);
+};
+
+const cleanUrl = (url: string) => url ? url.replace(/\/$/, '') : '';
+
+// Safe IP extraction helper
+const getClientIP = (req: Request): string => {
+    if (req.app.get('trust proxy')) {
+        const forwarded = req.headers['x-forwarded-for'];
+        if (typeof forwarded === 'string') {
+            return forwarded.split(',')[0].trim();
+        }
+        if (Array.isArray(forwarded)) {
+            return forwarded[0];
+        }
+    }
+    return req.ip || 'unknown';
+};
+
+const isValidAppUrl = (url: string): boolean => {
+    if (!url) return false;
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+        return false;
+    }
+};
+
+const isValidId = (id: string): boolean => {
+    if (!id || typeof id !== 'string') return false;
+    // Allow only alphanumeric chars and hyphens/underscores, max length 50
+    return /^[a-zA-Z0-9_\-]+$/.test(id) && id.length <= 50;
+};
+
+const isValidEmail = (email: string): boolean => {
+    return validator.isEmail(email, {
+        allow_utf8_local_part: false,
+        require_tld: true
+    });
+};
+
+const validateAndSplitEmails = (emailString: string | any): string[] => {
+    if (!emailString || typeof emailString !== 'string') return [];
+    const emails = emailString.split(',').map(e => e.trim()).filter(e => e.length > 0);
+    return emails.filter(email => {
+        if (!isValidEmail(email)) {
+            console.warn(`Invalid email filtered: ${email}`);
+            return false;
+        }
+        return true;
+    });
+};
+
+// Generate readable backup codes (6 groups of 4 characters)
+const generateBackupCodes = (): string[] => {
+    const codes = [];
+    for (let i = 0; i < 8; i++) {
+        const code = crypto.randomBytes(3).toString('hex').toUpperCase().match(/.{1,4}/g)?.join('-') || '';
+        codes.push(code);
+    }
+    return codes;
+};
+
+// Encrypt sensitive data (for TOTP secrets and backup codes)
+const encryptData = (data: string): string => {
+    const algorithm = 'aes-256-gcm';
+    // FIX: Use random salt for each encryption
+    const salt = crypto.randomBytes(16);
+    const key = crypto.scryptSync(JWT_SECRET, salt, 32);
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(algorithm, key, iv);
+
+    let encrypted = cipher.update(data, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+
+    // Format: salt:iv:authTag:encrypted
+    return `${salt.toString('hex')}:${iv.toString('hex')}:${authTag}:${encrypted}`;
+};
+
+const decryptData = (encryptedData: string): string => {
+    const algorithm = 'aes-256-gcm';
+    const parts = encryptedData.split(':');
+
+    let salt, ivHex, authTagHex, encrypted;
+
+    if (parts.length === 4) {
+        // New format: salt:iv:authTag:encrypted
+        [salt, ivHex, authTagHex, encrypted] = parts;
+        salt = Buffer.from(salt, 'hex');
+    } else {
+        throw new Error('Invalid encrypted data format');
+    }
+
+    const key = crypto.scryptSync(JWT_SECRET, salt, 32);
+
+    const decipher = crypto.createDecipheriv(algorithm, key, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(authTagHex, 'hex'));
+
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+
+    return decrypted;
+};
+
+const isStrongPassword = (password: string): { valid: boolean; error?: string } => {
+    if (!password || typeof password !== 'string') {
+        return { valid: false, error: 'Password is required' };
+    }
+    if (password.length > 128) {
+        return { valid: false, error: 'Password cannot exceed 128 characters' };
+    }
+    if (password.length < 8) {
+        return { valid: false, error: 'Password must be at least 8 characters' };
+    }
+    if (!/[a-z]/.test(password)) {
+        return { valid: false, error: 'Password must contain at least one lowercase letter' };
+    }
+    if (!/[A-Z]/.test(password)) {
+        return { valid: false, error: 'Password must contain at least one uppercase letter' };
+    }
+    if (!/[0-9]/.test(password)) {
+        return { valid: false, error: 'Password must contain at least one number' };
+    }
+    return { valid: true };
+};
+
+/**
+ * Shared SMTP transport options. Explicit timeouts avoid flaky "Greeting never received" / ETIMEDOUT
+ * on slower networks and align behaviour across Nodemailer major versions.
+ */
+function createSmtpTransportOptions(opts: {
+    host: string;
+    port: number;
+    secure: boolean;
+    auth: { user: string; pass: string };
+}) {
+    return {
+        host: opts.host,
+        port: opts.port,
+        secure: opts.secure,
+        auth: opts.auth,
+        tls: { rejectUnauthorized: false },
+        connectionTimeout: 25_000,
+        greetingTimeout: 20_000,
+        socketTimeout: 60_000,
+    };
+}
+
+function humanizeSmtpError(err: unknown): string {
+    const e = err as { message?: string; code?: string };
+    const msg = String(e?.message || err || '').toLowerCase();
+    const code = String(e?.code || '');
+    if (msg.includes('greeting never received') || code === 'ETIMEDOUT' || msg.includes('timeout') || msg.includes('econnrefused')) {
+        return (
+            'Could not complete the SMTP connection (timeout or no server greeting). Check host and port, firewall/VPN, ' +
+            'and that TLS matches the port (common: port 465 with TLS on, or port 587 with TLS off for STARTTLS).'
+        );
+    }
+    if (msg.includes('invalid login') || msg.includes('authentication failed') || msg.includes('535')) {
+        return 'SMTP authentication failed. Check username and password.';
+    }
+    return typeof e?.message === 'string' && e.message.length > 0 ? e.message : 'Could not send email';
+}
+
+/** Returns true only when mail was actually handed to SMTP (not skipped: no SMTP, invalid address). */
+async function sendEmail(to: string, subject: string, rawMessage: string, ctaLink?: string, ctaText?: string): Promise<boolean> {
+    if (DEMO_MODE) {
+        console.log(`[DEMO] Email not sent — To: ${to}, Subject: ${subject}`);
+        return false;
+    }
+    const config = await getConfig();
+    if (!config.smtpHost) return false;
+    if (!isValidEmail(to)) {
+        console.error(`Blocked email send to invalid address: ${to}`);
+        return false;
+    }
+
+    const safeSubject = sanitizeEmailHeader(subject);
+
+    try {
+        const transporter = nodemailer.createTransport(
+            createSmtpTransportOptions({
+                host: config.smtpHost,
+                port: parseInt(String(config.smtpPort), 10) || 465,
+                secure: !!config.smtpSecure,
+                auth: { user: config.smtpUser, pass: config.smtpPass },
+            })
+        );
+
+        const appName = config.appName || 'Nexo Share';
+        const safeHeaderAppName = sanitizeEmailHeader(appName);
+        const baseUrl = getBaseUrl(config);
+        const logoSrc = resolveEmailLogoSrc(config.logoUrl, baseUrl);
+
+        const html = buildEmailHtml({
+            appName,
+            subject: safeSubject,
+            bodyHtml: rawMessage,
+            ctaLink,
+            ctaText,
+            logoSrc,
+        });
+
+        // Gebruik smtpFrom als die is ingesteld, anders smtpUser
+        const fromEmail = config.smtpFrom || config.smtpUser;
+        const fromHeader = fromEmail.includes('<') ? fromEmail : `"${safeHeaderAppName}" <${fromEmail}>`;
+        await transporter.sendMail({ from: fromHeader, to, subject: safeSubject, html });
+        return true;
+    } catch (e: any) {
+        // Log the SPECIFIC error to the server console so you can see it
+        console.error("❌ SMTP SEND ERROR:", e.message);
+        throw e; // Rethrow so the 500 triggers (but now you know why)
+    }
+}
+
+// --- Audit Logging ---
+const logAudit = async (
+    userId: number | null,
+    action: string,
+    resourceType: string,
+    resourceId: string,
+    req: Request,
+    details?: any
+) => {
+    try {
+        await pool.query(
+            `INSERT INTO audit_logs (user_id, action, resource_type, resource_id, ip_address, user_agent, details) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [userId, action, resourceType, resourceId, getClientIP(req), req.headers['user-agent'], details ? JSON.stringify(details) : null]
+        );
+    } catch (e) {
+        console.error('Audit log error:', e);
+    }
+};
+
+// --- Middleware ---
+
+// Helper om cookies te parsen zonder externe library
+const parseCookies = (request: Request) => {
+    const list: any = {};
+    const cookieHeader = request.headers.cookie;
+    if (!cookieHeader) return list;
+    cookieHeader.split(';').forEach(function (cookie) {
+        let [name, ...rest] = cookie.split('=');
+        name = name?.trim();
+        if (!name) return;
+        const value = rest.join('=').trim();
+        if (!value) return;
+        list[name] = decodeURIComponent(value);
+    });
+    return list;
+};
+
+const authenticateToken: RequestHandler = (req, res, next) => {
+    // Probeer token uit HttpOnly cookie te halen, fallback naar header (voor API calls)
+    const cookies = parseCookies(req);
+    const token = cookies.token || req.headers['authorization']?.split(' ')[1];
+
+    if (!token) { res.status(401).json({ error: 'Access denied' }); return; }
+
+    jwt.verify(token, JWT_SECRET, (err: any, decoded: any) => {
+        if (err) { res.status(403).json({ error: 'Invalid token' }); return; }
+        (req as AuthRequest).user = decoded as JWTPayload;
+        next();
+    });
+};
+
+const requireAdmin: RequestHandler = (req, res, next) => {
+    const authReq = req as AuthRequest;
+    if (!authReq.user?.isAdmin) return res.status(403).json({ error: 'Admin required' });
+    next();
+};
+
+const attachUploadByteMonitor = (
+    req: import('express').Request,
+    res: import('express').Response,
+    maxBytes: number,
+    maxSizeVal: number,
+    maxSizeUnit: string
+) => {
+    let received = 0;
+    const onData = (chunk: Buffer) => {
+        received += chunk.length;
+        if (received > maxBytes) {
+            req.off('data', onData);
+            req.unpipe();
+            if (!res.headersSent) {
+                res.status(413).json({ error: `Upload exceeded limit of ${maxSizeVal} ${maxSizeUnit}` });
+            }
+            req.destroy();
+        }
+    };
+    req.on('data', onData);
+    const onEnd = () => req.off('data', onData);
+    res.on('finish', onEnd);
+    res.on('close', onEnd);
+    req.on('end', onEnd);
+};
+
+/**
+ * Enforce max upload size via Content-Length + byte monitor.
+ * Avoid pause→await→next without resume: that hangs multipart bodies behind
+ * reverse proxies and surfaces as HTTP 504 (common on demo/guest uploads).
+ */
+const checkUploadLimits: RequestHandler = (req, res, next) => {
+    const apply = (config: { maxSizeVal?: number; maxSizeUnit?: string }) => {
+        const maxSizeVal = config.maxSizeVal || 10;
+        const maxSizeUnit = config.maxSizeUnit || 'GB';
+        const maxBytes = getBytes(maxSizeVal, maxSizeUnit);
+        const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+            return res.status(413).json({ error: `File too large. Maximum ${maxSizeVal} ${maxSizeUnit}` });
+        }
+
+        attachUploadByteMonitor(req, res, maxBytes, maxSizeVal, maxSizeUnit);
+        next();
+    };
+
+    // Warm cache: fully synchronous — no stream pause, no proxy idle timeout.
+    if (configCache && Date.now() - configCacheTime < 10000) {
+        return apply(configCache);
+    }
+
+    // Cold cache: pause only for the brief config fetch, then resume before multer.
+    req.pause();
+    getConfig()
+        .then((config) => {
+            const maxSizeVal = config.maxSizeVal || 10;
+            const maxSizeUnit = config.maxSizeUnit || 'GB';
+            const maxBytes = getBytes(maxSizeVal, maxSizeUnit);
+            const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+
+            if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+                req.resume();
+                return res.status(413).json({ error: `File too large. Maximum ${maxSizeVal} ${maxSizeUnit}` });
+            }
+
+            attachUploadByteMonitor(req, res, maxBytes, maxSizeVal, maxSizeUnit);
+            req.resume();
+            next();
+        })
+        .catch((err) => {
+            req.resume();
+            next(err);
+        });
+};
+
+const RESERVED_SLUGS = ['api', 'admin', 'config', 's', 'r', 'login', 'reset-password'];
+
+const isValidSlug = (slug: string): boolean => {
+    if (!slug || typeof slug !== 'string') return false;
+    if (slug.length < 3 || slug.length > 50) return false; // Minimaal 3 karakters
+    if (RESERVED_SLUGS.includes(slug.toLowerCase())) return false;
+
+    // ALLEEN letters, cijfers en koppeltekens/underscores toegestaan
+    if (!/^[a-zA-Z0-9-_]+$/.test(slug)) return false;
+
+    // Mag niet beginnen of eindigen met een speciaal teken
+    if (/^[-_]|[-_]$/.test(slug)) return false;
+
+    // Geen dubbele speciale tekens (zoals -- of __)
+    if (/[-_]{2,}/.test(slug)) return false;
+
+    return true;
+};
+
+const handleUploadId: RequestHandler = async (req, res, next) => {
+    const authReq = req as AuthRequest;
+
+    // Bij multer uploads is body al geparsed, maar we moeten wel checken of het bestaat
+    const customSlug = authReq.body?.customSlug;
+
+    if (customSlug && typeof customSlug === 'string' && customSlug.trim() !== '') {
+        const slug = customSlug.trim();
+        if (!isValidSlug(slug)) {
+            return res.status(400).json({ error: 'Link may only contain letters, numbers and hyphens.' });
+        }
+
+        // Check of slug al bestaat, TENZIJ we een bestaande share updaten
+        const currentId = authReq.params.id;
+        if (!currentId || currentId !== slug) {
+            const check = await pool.query('SELECT id FROM shares WHERE id = $1', [slug]);
+            if (check.rows.length > 0) {
+                return res.status(409).json({ error: 'Link is already in use.' });
+            }
+        }
+        authReq.uploadId = slug;
+    } else if (authReq.params.id) {
+        if (!isValidSlug(authReq.params.id)) {
+            return res.status(400).json({ error: 'Invalid ID' });
+        }
+        authReq.uploadId = authReq.params.id;
+    } else {
+        authReq.uploadId = await generateSecureId();
+    }
+    next();
+};
+
+// --- Virusscanner Helper ---
+const scanFiles = async (files: Express.Multer.File[]) => {
+    const config = await getConfig();
+    for (const file of files) {
+        await scanPathWithClamav({
+            filePath: file.path,
+            displayName: file.originalname,
+            fileSizeBytes: file.size,
+            config,
+            demoMode: DEMO_MODE,
+            scanContext: 'internal',
+            clamscanInstance,
+            unlink: safeUnlink,
+            scanTimeoutMs: CLAMAV_TIMEOUT_MS,
+        });
+    }
+};
+
+const generateUploadId: RequestHandler = async (req, res, next) => {
+    (req as AuthRequest).uploadId = await generateSecureId();
+    next();
+};
+
+const storage = multer.diskStorage({
+    destination: async (req, file, cb) => {
+        const authReq = req as AuthRequest;
+        const id = authReq.uploadId || await generateSecureId();
+        authReq.uploadId = id;
+        const safeId = path.basename(id);
+        const dir = path.join(UPLOAD_DIR, safeId);
+        try {
+            await fs.mkdir(dir, { recursive: true });
+            cb(null, dir);
+        } catch (e: any) {
+            cb(e, dir);
+        }
+    },
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname);
+        cb(null, crypto.randomBytes(8).toString('hex') + ext);
+    }
+});
+const MAIN_UPLOAD_FILE_LIMIT = DEMO_MODE ? getBytes(DEMO_MAX_FILE_MB, 'MB') : 1024 * 1024 * 1024 * 1024;
+const upload = multer({
+    storage,
+    limits: { fileSize: MAIN_UPLOAD_FILE_LIMIT },
+    fileFilter: (req, file, cb) => {
+        getConfig()
+            .then((config) => {
+                const blocklist = getUploadBlocklist(config, 'user');
+                if (blocklist.length > 0 && !checkExtension(file.originalname, blocklist)) {
+                    return cb(new Error('This file type is not allowed per configuration.'));
+                }
+                cb(null, true);
+            })
+            .catch((err) => cb(err));
+    },
+});
+
+// --- SYSTEM UPLOAD CONFIG ---
+const systemStorage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, SYSTEM_DIR),
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname);
+        const name = file.fieldname === 'logo' ? 'logo' : 'favicon';
+        // Timestamp toevoegen om caching te voorkomen bij updates
+        cb(null, `${name}-${Date.now()}${ext}`);
+    }
+});
+
+const uploadSystem = multer({
+    storage: systemStorage,
+    limits: { fileSize: 50 * 1024 * 1024 }, // Max 50MB
+    fileFilter: (req, file, cb) => {
+        const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/svg+xml', 'image/x-icon', 'image/vnd.microsoft.icon'];
+        // SECURITY Check ook de extensie, niet alleen het mime-type
+        const ext = path.extname(file.originalname).toLowerCase();
+        const allowedExts = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico'];
+
+        if (allowedMimeTypes.includes(file.mimetype) && allowedExts.includes(ext)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only images (PNG, JPG, GIF, SVG, ICO) are allowed'));
+        }
+    }
+});
+
+// --- API Router Definition ---
+const apiRouter = express.Router();
+
+// --- ROUTES ---
+
+// AUTH - LOGIN (Met Rate Limiter & Generic Error)
+apiRouter.post('/auth/login', loginLimiter, async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+
+        const genericError = 'Invalid account or password';
+
+        // Timing Attack Preventie
+        // Als user niet bestaat, doen we TOCH een compare tegen een dummy hash
+        // zodat de responstijd altijd ongeveer gelijk is.
+        if (result.rows.length === 0) {
+            await Bun.password.verify(password, '$2b$10$Xw.sY.f/O/W.S/./././././././././././././././.');
+            return res.status(401).json({ error: genericError });
+        }
+
+        const user = result.rows[0];
+        const valid = await Bun.password.verify(password, result.rows[0].password_hash);
+        if (!valid) return res.status(401).json({ error: genericError });
+
+        // Check if 2FA is enabled for this user
+        if (user.totp_enabled) {
+            return res.json({ requires2FA: true, email: user.email });
+        }
+
+        const config = await getConfig();
+
+        // Check if 2FA is required but not set up (only for non-SSO users)
+        if (config.require2FA && !user.totp_enabled) {
+            const token = jwt.sign({ id: user.id, email: user.email, isAdmin: user.is_admin }, JWT_SECRET, { expiresIn: '15m' });
+
+            // --- OOK HIER HET COOKIE ZETTEN ---
+            // Dit is nodig zodat de vervolg-call naar '/auth/2fa/setup' geautoriseerd is
+            const isProduction = process.env.NODE_ENV === 'production';
+            const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+            // Let op: we gebruiken hier de '15m' expiry van het tijdelijke token
+            res.cookie('token', token, {
+                httpOnly: true,
+                secure: process.env.NODE_ENV === 'production',
+                sameSite: isProduction ? 'strict' : 'lax',
+                maxAge: 15 * 60 * 1000 // 15 Minutes
+            });
+
+            return res.json({
+                requiresSetup2FA: true,
+                // tempToken mag blijven voor legacy, maar cookie doet het werk
+                tempToken: token,
+                user: { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin }
+            });
+        }
+
+        const token = jwt.sign({ id: user.id, email: user.email, isAdmin: user.is_admin }, JWT_SECRET, { expiresIn: getTimeInMs(config.sessionVal, config.sessionUnit) / 1000 });
+        await logAudit(user.id, 'login', 'user', user.id.toString(), req);
+
+        // Bepaal of we lokaal draaien
+        // Als we GEEN https gebruiken (lokaal), moet secure FALSE zijn en SameSite LAX
+        const isProduction = process.env.NODE_ENV === 'production';
+        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+        res.cookie('token', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: isProduction ? 'strict' : 'lax',
+            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
+        });
+
+        // Stuur user info terug, maar GEEN token in de body (zodat frontend het niet in localStorage zet)
+        res.json({ success: true, user: { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin } });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// index.ts
+apiRouter.post('/auth/logout', async (req, res) => {
+    try {
+        // 1. Haal de actuele config op, zodat we weten of secureCookies aan of uit staat
+        const config = await getConfig();
+
+        // 2. Clear de cookie met EXACT dezelfde instellingen als bij het inloggen
+        res.clearCookie('token', {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'strict',
+            path: '/'
+        });
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Logout error:', e);
+        res.status(500).json({ error: 'Uitloggen failed' });
+    }
+});
+
+// 2FA - Verify TOTP during login
+apiRouter.post('/auth/verify-2fa', loginLimiter, async (req, res) => {
+    try {
+        const { email, password, code } = req.body;
+
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const user = result.rows[0];
+        const validPassword = await Bun.password.verify(password, user.password_hash);
+        if (!validPassword) return res.status(401).json({ error: 'Invalid credentials' });
+
+        if (!user.totp_enabled) return res.status(400).json({ error: '2FA not enabled' });
+
+        const secret = decryptData(user.totp_secret);
+
+        // Check TOTP code
+        const validToken = speakeasy.totp.verify({
+            secret,
+            encoding: 'base32',
+            token: code,
+            window: 2
+        });
+
+        if (!validToken) {
+            // Check backup codes
+            if (user.backup_codes) {
+                const backupCodes = JSON.parse(decryptData(user.backup_codes));
+                const hashedCode = crypto.createHash('sha256').update(code).digest('hex');
+                const codeIndex = backupCodes.findIndex((c: string) => c === hashedCode);
+
+                if (codeIndex === -1) {
+                    return res.status(401).json({ error: 'Invalid code' });
+                }
+
+                // Remove used backup code
+                backupCodes.splice(codeIndex, 1);
+                const encryptedCodes = encryptData(JSON.stringify(backupCodes));
+                await pool.query('UPDATE users SET backup_codes = $1 WHERE id = $2', [encryptedCodes, user.id]);
+            } else {
+                return res.status(401).json({ error: 'Invalid code' });
+            }
+        }
+
+        const config = await getConfig();
+        const token = jwt.sign(
+            { id: user.id, email: user.email, isAdmin: user.is_admin },
+            JWT_SECRET,
+            { expiresIn: getTimeInMs(config.sessionVal, config.sessionUnit) / 1000 }
+        );
+
+        await logAudit(user.id, 'login_2fa', 'user', user.id.toString(), req);
+
+        const isProduction = process.env.NODE_ENV === 'production';
+        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+        res.cookie('token', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: isProduction ? 'strict' : 'lax',
+            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
+        });
+
+        res.json({ token, user: { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin } });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// 2FA - Setup (Generate Secret & QR)
+apiRouter.post('/auth/2fa/setup', authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthRequest;
+        const config = await getConfig();
+
+        const secret = speakeasy.generateSecret({
+            name: `${config.appName || 'Nexo Share'} (${authReq.user!.email})`,
+            length: 32
+        });
+
+        const qrCode = await QRCode.toDataURL(secret.otpauth_url!);
+
+        res.json({
+            secret: secret.base32,
+            qrCode,
+            manualEntry: secret.base32
+        });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Setup failed' });
+    }
+});
+
+// 2FA - Enable (Verify and Save)
+apiRouter.post('/auth/2fa/enable', authenticateToken, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: 2FA setup is disabled.' });
+    try {
+        const authReq = req as AuthRequest;
+        const { secret, code } = req.body;
+
+        const verified = speakeasy.totp.verify({
+            secret,
+            encoding: 'base32',
+            token: code,
+            window: 2
+        });
+
+        if (!verified) {
+            return res.status(400).json({ error: 'Invalid code, try again' });
+        }
+
+        // Generate backup codes
+        const backupCodes = generateBackupCodes();
+        const hashedCodes = backupCodes.map(code =>
+            crypto.createHash('sha256').update(code).digest('hex')
+        );
+
+        const encryptedSecret = encryptData(secret);
+        const encryptedBackups = encryptData(JSON.stringify(hashedCodes));
+
+        await pool.query(
+            'UPDATE users SET totp_secret = $1, totp_enabled = TRUE, backup_codes = $2 WHERE id = $3',
+            [encryptedSecret, encryptedBackups, authReq.user!.id]
+        );
+
+        await logAudit(authReq.user!.id, '2fa_enabled', 'user', authReq.user!.id.toString(), req);
+
+        res.json({ success: true, backupCodes });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Enable failed' });
+    }
+});
+
+// 2FA - Disable
+apiRouter.post('/auth/2fa/disable', authenticateToken, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: 2FA changes are disabled.' });
+    try {
+        const authReq = req as AuthRequest;
+        const { password } = req.body;
+
+        const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [authReq.user!.id]);
+        const valid = await Bun.password.verify(password, result.rows[0].password_hash);
+
+        if (!valid) {
+            return res.status(401).json({ error: 'Incorrect Password' });
+        }
+
+        await pool.query(
+            'UPDATE users SET totp_secret = NULL, totp_enabled = FALSE, backup_codes = NULL WHERE id = $1',
+            [authReq.user!.id]
+        );
+
+        await logAudit(authReq.user!.id, '2fa_disabled', 'user', authReq.user!.id.toString(), req);
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Disable failed' });
+    }
+});
+
+// 2FA - Check Status
+apiRouter.get('/auth/2fa/status', authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthRequest;
+        const result = await pool.query(
+            'SELECT totp_enabled, backup_codes FROM users WHERE id = $1',
+            [authReq.user!.id]
+        );
+
+        let backupCodesRemaining = 0;
+        if (result.rows[0].backup_codes) {
+            const codes = JSON.parse(decryptData(result.rows[0].backup_codes));
+            backupCodesRemaining = codes.length;
+        }
+
+        res.json({
+            enabled: result.rows[0].totp_enabled,
+            backupCodesRemaining
+        });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Failed to retrieve status' });
+    }
+});
+
+// 2FA - Admin Reset for User
+apiRouter.post('/users/:id/2fa/reset', authenticateToken, requireAdmin, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: 2FA reset is disabled.' });
+    try {
+        await pool.query(
+            'UPDATE users SET totp_secret = NULL, totp_enabled = FALSE, backup_codes = NULL WHERE id = $1',
+            [req.params.id]
+        );
+
+        const authReq = req as AuthRequest;
+        await logAudit(authReq.user!.id, '2fa_admin_reset', 'user', req.params.id, req);
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Reset failed' });
+    }
+});
+
+// PASSKEYS - Registration Options
+apiRouter.post('/passkeys/register/options', authenticateToken, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: registering passkeys is disabled.' });
+    try {
+        const authReq = req as AuthRequest;
+        const user = await pool.query('SELECT * FROM users WHERE id = $1', [authReq.user!.id]);
+
+        // HAAL DOMEIN UIT DATABASE CONFIG OF REQUEST HEADER
+        const config = await getConfig();
+        const baseUrl = getBaseUrl(config, req);
+        const rpID = new URL(baseUrl).hostname; // Pakt alleen 'wetransfer.famretera.nl'
+
+        const options = await generateRegistrationOptions({
+            rpName: config.appName || 'Nexo Share',
+            rpID: rpID, // Dynamisch!
+            userID: new TextEncoder().encode(String(user.rows[0].id)),
+            userName: user.rows[0].email,
+            userDisplayName: user.rows[0].name,
+            attestationType: 'none',
+            authenticatorSelection: {
+                residentKey: 'preferred',
+                userVerification: 'preferred',
+            },
+        });
+
+        req.app.locals[`challenge_${authReq.user!.id}`] = options.challenge;
+        res.json(options);
+    } catch (e) {
+        console.error('Register Options Error:', e);
+        res.status(500).json({ error: 'Options genereren failed' });
+    }
+});
+
+// PASSKEYS - Verify Registration
+apiRouter.post('/passkeys/register/verify', authenticateToken, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: passkey setup is disabled.' });
+    try {
+        const authReq = req as AuthRequest;
+        const { response, name } = req.body;
+
+        // CONFIG OPHALEN
+        const config = await getConfig();
+        const baseUrl = getBaseUrl(config, req);
+        const rpID = new URL(baseUrl).hostname;
+
+        const expectedChallenge = req.app.locals[`challenge_${authReq.user!.id}`];
+
+        const verification = await verifyRegistrationResponse({
+            response: response as any,
+            expectedChallenge,
+            expectedOrigin: baseUrl, // Checkt: https://wetransfer.famretera.nl
+            expectedRPID: rpID,      // Checkt: wetransfer.famretera.nl
+            requireUserVerification: false,
+        });
+
+        if (verification.verified && verification.registrationInfo) {
+            const { credential } = verification.registrationInfo;
+
+            await pool.query(
+                'INSERT INTO passkeys (user_id, credential_id, public_key, counter, name) VALUES ($1, $2, $3, $4, $5)',
+                [
+                    authReq.user!.id,
+                    Buffer.from(credential.id, 'base64url').toString('base64'),
+                    Buffer.from(credential.publicKey).toString('base64'),
+                    credential.counter,
+                    name || 'Unnamed Passkey'
+                ]
+            );
+
+            delete req.app.locals[`challenge_${authReq.user!.id}`];
+            await logAudit(authReq.user!.id, 'passkey_registered', 'user', authReq.user!.id.toString(), req);
+            res.json({ success: true });
+        } else {
+            res.status(400).json({ error: 'Verification failed' });
+        }
+    } catch (e) {
+        console.error('Register Verify Error:', e);
+        res.status(500).json({ error: 'Registratie failed' });
+    }
+});
+
+// PASSKEYS - List
+apiRouter.get('/passkeys', authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthRequest;
+        const result = await pool.query(
+            'SELECT id, name, created_at FROM passkeys WHERE user_id = $1 ORDER BY created_at DESC',
+            [authReq.user!.id]
+        );
+        res.json(result.rows);
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Retrieval failed' });
+    }
+});
+
+// PASSKEYS - Delete
+apiRouter.delete('/passkeys/:id', authenticateToken, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: deleting passkeys is disabled.' });
+    try {
+        const authReq = req as AuthRequest;
+        await pool.query(
+            'DELETE FROM passkeys WHERE id = $1 AND user_id = $2',
+            [req.params.id, authReq.user!.id]
+        );
+
+        await logAudit(authReq.user!.id, 'passkey_deleted', 'user', authReq.user!.id.toString(), req);
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Deletion failed' });
+    }
+});
+
+// PASSKEYS - Authentication Options (Public)
+apiRouter.post('/passkeys/auth/options', async (req, res) => {
+    try {
+        const config = await getConfig();
+        const baseUrl = getBaseUrl(config, req);
+        const rpID = new URL(baseUrl).hostname;
+
+        const options = await generateAuthenticationOptions({
+            rpID: rpID, // Dynamisch
+            userVerification: 'preferred',
+        });
+
+        // Voorkom memory leak. Verwijder de challenge automatisch na 2 minuten.
+        const challengeKey = `auth_challenge_${options.challenge}`;
+        req.app.locals[challengeKey] = options.challenge;
+
+        setTimeout(() => {
+            if (req.app.locals[challengeKey]) delete req.app.locals[challengeKey];
+        }, 120000); // 2 minuten
+
+        res.json(options);
+    } catch (e) {
+        console.error('Auth Options Error:', e);
+        res.status(500).json({ error: 'Options genereren failed' });
+    }
+});
+
+// PASSKEYS - Verify Authentication (Public)
+apiRouter.post('/passkeys/auth/verify', async (req, res) => {
+    try {
+        const { response, challenge } = req.body;
+        const credentialID = Buffer.from(response.id, 'base64url').toString('base64');
+
+        const passkeyResult = await pool.query(
+            'SELECT p.*, u.id as user_id, u.email, u.name, u.is_admin FROM passkeys p JOIN users u ON p.user_id = u.id WHERE p.credential_id = $1',
+            [credentialID]
+        );
+
+        if (passkeyResult.rows.length === 0) {
+            return res.status(400).json({ error: 'Passkey not found' });
+        }
+
+        const passkey = passkeyResult.rows[0];
+        const expectedChallenge = req.app.locals[`auth_challenge_${challenge}`];
+
+        const config = await getConfig();
+        const baseUrl = getBaseUrl(config, req);
+        const rpID = new URL(baseUrl).hostname;
+
+        const verification = await verifyAuthenticationResponse({
+            response: response as any,
+            expectedChallenge,
+            expectedOrigin: baseUrl, // Dynamisch
+            expectedRPID: rpID,      // Dynamisch
+            requireUserVerification: false,
+            credential: {
+                id: Buffer.from(passkey.credential_id, 'base64').toString('base64url'),
+                publicKey: Buffer.from(passkey.public_key, 'base64'),
+                counter: parseInt(passkey.counter)
+            }
+        });
+
+        if (verification.verified) {
+            await pool.query(
+                'UPDATE passkeys SET counter = $1 WHERE id = $2',
+                [verification.authenticationInfo.newCounter, passkey.id]
+            );
+
+            const token = jwt.sign(
+                { id: passkey.user_id, email: passkey.email, isAdmin: passkey.is_admin },
+                JWT_SECRET,
+                { expiresIn: getTimeInMs(config.sessionVal, config.sessionUnit) / 1000 }
+            );
+
+            delete req.app.locals[`auth_challenge_${response.response.challenge}`];
+
+            // COOKIE ZETTEN (Net als bij SSO en Login)
+            const isProduction = process.env.NODE_ENV === 'production';
+            const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+            res.cookie('token', token, {
+                httpOnly: true,
+                secure: process.env.NODE_ENV === 'production',
+                sameSite: isProduction ? 'strict' : 'lax',
+                maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
+            });
+
+            res.json({
+                user: { id: passkey.user_id, email: passkey.email, name: passkey.name, is_admin: passkey.is_admin }
+            });
+        } else {
+            res.status(400).json({ error: 'Verification failed' });
+        }
+    } catch (e) {
+        console.error('Auth Verify Error:', e);
+        res.status(500).json({ error: 'Authenticatie failed' });
+    }
+});
+
+// PASSWORD RESET - Request
+apiRouter.post('/auth/password-reset/request', passwordResetLimiter, async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        const config = await getConfig();
+        if (!config.allowPasswordReset) {
+            return res.status(403).json({ error: 'Password reset is disabled' });
+        }
+
+        if (!config.smtpHost) {
+            return res.status(503).json({ error: 'Email is not configured' });
+        }
+
+        const userResult = await pool.query('SELECT id, name FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+
+        // Always return success to prevent email enumeration
+        if (userResult.rows.length === 0) {
+            // Voeg een nep-vertraging toe om timing attacks te voorkomen.
+            // We simuleren de tijd die het kost om een token te genereren en email te sturen.
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 200 + 100)); // 100-300ms delay
+            return res.json({ success: true });
+        }
+
+        const user = userResult.rows[0];
+        const token = crypto.randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+        await pool.query(
+            'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
+            [user.id, token, expiresAt]
+        );
+
+        // Geef 'req' mee aan de functie
+        const baseUrl = getBaseUrl(config, req);
+        if (!baseUrl) return res.status(500).json({ error: 'Server URL niet geconfigureerd' });
+
+        const resetUrl = `${baseUrl}/reset-password?token=${token}`;
+
+        await sendEmail(
+            email,
+            'Reset Password',
+            `<p>Hello ${escapeHtml(user.name)},</p>
+             <p>You have requested a password reset. Click the button below to proceed.</p>
+             <p>This link is valid for 1 hour.</p>`,
+            resetUrl,
+            'Reset Password'
+        );
+
+        res.json({ success: true });
+    } catch (e: any) {
+        console.error('Password reset request failed:', e);
+        res.status(500).json({ error: e.message || 'Request failed' });
+    }
+});
+
+// PASSWORD RESET - Verify Token
+apiRouter.post('/auth/password-reset/verify', async (req, res) => {
+    try {
+        const { token } = req.body;
+
+        const result = await pool.query(
+            'SELECT user_id, expires_at, used FROM password_reset_tokens WHERE token = $1',
+            [token]
+        );
+
+        if (result.rows.length === 0 || result.rows[0].used) {
+            return res.status(400).json({ error: 'Invalid or expired token' });
+        }
+
+        if (new Date() > new Date(result.rows[0].expires_at)) {
+            return res.status(400).json({ error: 'Token expired' });
+        }
+
+        res.json({ valid: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Verification failed' });
+    }
+});
+
+// PASSWORD RESET - Complete
+apiRouter.post('/auth/password-reset/complete', async (req, res) => {
+    try {
+        const { token, password } = req.body;
+
+        const passwordCheck = isStrongPassword(password);
+        if (!passwordCheck.valid) {
+            return res.status(400).json({ error: passwordCheck.error });
+        }
+
+        const result = await pool.query(
+            'SELECT user_id, expires_at, used FROM password_reset_tokens WHERE token = $1',
+            [token]
+        );
+
+        if (result.rows.length === 0 || result.rows[0].used) {
+            return res.status(400).json({ error: 'Invalid or expired token' });
+        }
+
+        if (new Date() > new Date(result.rows[0].expires_at)) {
+            return res.status(400).json({ error: 'Token expired' });
+        }
+
+        const hash = await Bun.password.hash(password);
+
+        await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, result.rows[0].user_id]);
+        await pool.query('UPDATE password_reset_tokens SET used = TRUE WHERE token = $1', [token]);
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Reset failed' });
+    }
+});
+
+// Check if user needs 2FA setup (for forced 2FA)
+apiRouter.get('/auth/check-2fa-requirement', authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthRequest;
+        const config = await getConfig();
+
+        if (!config.require2FA) {
+            return res.json({ required: false });
+        }
+
+        const result = await pool.query(
+            'SELECT totp_enabled FROM users WHERE id = $1',
+            [authReq.user!.id]
+        );
+
+        res.json({ required: !result.rows[0].totp_enabled });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Check failed' });
+    }
+});
+
+// --- Utility Route voor ID generatie (Idee: ID Feature) ---
+apiRouter.get('/utils/generate-id', authenticateToken, async (req, res) => {
+    // FIX: Safely parse 'length' query parameter (string) or default to 12
+    let length = 12;
+
+    // Use URLSearchParams to avoid prototype issues
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const lenParam = url.searchParams.get('length');
+
+    if (lenParam) {
+        const parsed = parseInt(lenParam, 10);
+        if (!isNaN(parsed)) {
+            length = parsed;
+        }
+    }
+
+    const safeLength = Math.min(Math.max(length, 8), 64);
+    const id = crypto.randomBytes(Math.ceil(safeLength / 2)).toString('hex').slice(0, safeLength);
+    res.json({ id });
+});
+apiRouter.get('/utils/qr', authenticateToken, async (req, res) => {
+    try {
+        const url = req.query.url as string;
+        if (!url) return res.status(400).send('URL required');
+
+        // Genereer QR als Data URL
+        const qr = await QRCode.toDataURL(url, {
+            margin: 1,
+            color: {
+                dark: '#000000',  // Zwarte blokjes
+                light: '#00000000' // Transparante achtergrond
+            }
+        });
+        res.json({ qr });
+    } catch (e) {
+        console.error('QR Error:', e);
+        res.status(500).json({ error: 'QR Generation failed' });
+    }
+});
+
+// AUTH - SSO INIT (HTTP Redirect)
+apiRouter.get('/auth/sso', async (req, res) => {
+    try {
+        const config = await getConfig();
+        if (!config.ssoEnabled) return res.status(404).send('SSO not active');
+
+        // Validate appUrl
+        if (!isValidAppUrl(config.appUrl)) {
+            console.error('[SSO] Invalid appUrl configured:', config.appUrl);
+            return res.status(500).send('Invalid SSO configuration');
+        }
+
+        let issuerOrigin = '';
+        try {
+            const issuerUrl = new URL(config.oidcIssuer);
+            // Verify protocol to prevent javascript: or other harmful protocols
+            if (issuerUrl.protocol !== 'http:' && issuerUrl.protocol !== 'https:') {
+                throw new Error('Invalid protocol');
+            }
+            issuerOrigin = issuerUrl.origin;
+        } catch (e) {
+            console.error('[SSO] Invalid Issuer URL:', config.oidcIssuer);
+            return res.status(500).send('Invalid SSO Configuration: Issuer URL must be a valid HTTP(S) URL');
+        }
+
+        const redirectUri = `${cleanUrl(config.appUrl)}/api/auth/callback`;
+        const params = new URLSearchParams({
+            client_id: config.oidcClientId,
+            redirect_uri: redirectUri,
+            response_type: 'code',
+            // `groups` is needed for Authentik / many IdPs to include group membership in userinfo
+            scope: 'openid profile email groups',
+        });
+
+        const targetUrl = `${issuerOrigin}/application/o/authorize/?${params.toString()}`;
+
+        // Zet een tijdelijke cookie om CSRF te voorkomen
+        res.cookie('sso_init', '1', { httpOnly: true, maxAge: 300000, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' || config.secureCookies });
+
+        // Validate Target URL to prevent Open Redirect
+        // Validate Target URL to prevent Open Redirect
+        // Strictly allow only http/https protocols using validator
+        // Validate Target URL to prevent Open Redirect (Zod Strict)
+        // Validate Target URL to prevent Open Redirect (Strict Whitelist)
+        const isSafeUrl = (url: string) => {
+            try {
+                const parsed = new URL(url);
+                return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+            } catch {
+                return false;
+            }
+        };
+
+        // Open Redirect Protection: MUST start with the configured trusted issuer
+        if (!targetUrl.startsWith(issuerOrigin)) {
+            console.error('[SSO] Redirect Target does not match trusted Issuer:', targetUrl);
+            return res.status(500).send('Invalid Redirect URL: Target origin mismatch');
+        }
+
+        res.redirect(targetUrl);
+    } catch (e: any) {
+        console.error('[SSO] Init error:', e.message);
+        res.status(500).type('text/plain').send('SSO Error: ' + e.message);
+    }
+});
+
+// AUTH - SSO CALLBACK
+apiRouter.get('/auth/callback', async (req, res) => {
+    try {
+        const { code } = req.query;
+        if (!code) return res.status(400).send('No code received');
+
+        // Check of de sso_init cookie bestaat. Zo niet -> CSRF aanval of sessie verlopen.
+        const cookies = parseCookies(req);
+        if (!cookies.sso_init) {
+            return res.status(400).send('Invalid SSO session (CSRF detected). Try again.');
+        }
+        res.clearCookie('sso_init'); // Cookie opruimen
+
+        const config = await getConfig();
+
+        // Validate appUrl
+        if (!isValidAppUrl(config.appUrl)) {
+            console.error('[SSO] Invalid appUrl configured');
+            return res.status(500).send('Invalid SSO configuration');
+        }
+
+        let issuerOrigin = '';
+        try { issuerOrigin = new URL(config.oidcIssuer).origin; } catch (e) { }
+
+        const redirectUri = `${cleanUrl(config.appUrl)}/api/auth/callback`;
+
+        const tokenParams = new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: code as string,
+            redirect_uri: redirectUri,
+            client_id: config.oidcClientId,
+            client_secret: config.oidcSecret,
+        });
+
+        const tokenRes = await axios.post(`${issuerOrigin}/application/o/token/`, tokenParams, {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+
+        const { access_token } = tokenRes.data;
+        const userRes = await axios.get(`${issuerOrigin}/application/o/userinfo/`, {
+            headers: { Authorization: `Bearer ${access_token}` }
+        });
+
+        const userData = userRes.data;
+        const email = userData.email;
+
+        if (!email) return res.status(400).send('No email received from provider');
+
+        let userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        let user;
+
+        const oidcGroups = extractOidcGroups(userData as Record<string, unknown>);
+        const adminResolution = resolveSsoAdminFromGroups(
+            userData as Record<string, unknown>,
+            config.ssoAdminGroups
+        );
+
+        if (userResult.rows.length === 0) {
+            const dummyHash = await Bun.password.hash(crypto.randomBytes(16).toString('hex'));
+            // Groups configured + IdP returned groups → membership. Otherwise non-admin (never auto-admin via SSO).
+            const isAdmin = adminResolution.mode === 'enforce' ? adminResolution.isAdmin : false;
+
+            const insertRes = await pool.query(
+                `INSERT INTO users (email, password_hash, name, is_admin, oidc_groups, oidc_groups_synced_at)
+                 VALUES ($1, $2, $3, $4, $5::jsonb, NOW()) RETURNING *`,
+                [
+                    email,
+                    dummyHash,
+                    userData.name || userData.preferred_username || 'SSO User',
+                    isAdmin,
+                    JSON.stringify(oidcGroups),
+                ]
+            );
+            user = insertRes.rows[0];
+        } else {
+            user = userResult.rows[0];
+            await pool.query(
+                `UPDATE users SET oidc_groups = $1::jsonb, oidc_groups_synced_at = NOW() WHERE id = $2`,
+                [JSON.stringify(oidcGroups), user.id]
+            );
+            user.oidc_groups = oidcGroups;
+            user.oidc_groups_synced_at = new Date();
+
+            if (adminResolution.mode === 'enforce') {
+                if (user.is_admin !== adminResolution.isAdmin) {
+                    await pool.query('UPDATE users SET is_admin = $1 WHERE id = $2', [
+                        adminResolution.isAdmin,
+                        user.id,
+                    ]);
+                    user.is_admin = adminResolution.isAdmin;
+                }
+            } else if (adminResolution.mode === 'claim_missing') {
+                console.warn(
+                    `[SSO] Admin groups are configured but IdP returned no groups for ${email}; leaving is_admin=${user.is_admin} unchanged`
+                );
+            }
+            // mode === 'skip': leave is_admin unchanged
+        }
+        console.log(`[SSO] Groups synced for ${email}: ${oidcGroups.length} group(s)`);
+
+        const token = jwt.sign(
+            { id: user.id, email: user.email, isAdmin: user.is_admin },
+            JWT_SECRET,
+            { expiresIn: getTimeInMs(config.sessionVal, config.sessionUnit) / 1000 }
+        );
+
+        // Store token securely in database with nonce
+        const nonce = crypto.randomUUID();
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+        // Encrypt JWT in database
+        const encryptedToken = encryptData(token);
+        await pool.query(
+            'INSERT INTO sso_tokens (nonce, token, user_data, expires_at) VALUES ($1, $2, $3, $4)',
+            [nonce, encryptedToken, JSON.stringify({ id: user.id, email: user.email, name: user.name, is_admin: user.is_admin }), expiresAt]
+        );
+
+        // Cleanup expired tokens
+        await pool.query('DELETE FROM sso_tokens WHERE expires_at < NOW()');
+
+        // Open Redirect Protection (Zod Strict)
+        // Open Redirect Protection (Strict Whitelist)
+        const loginUrl = `${cleanUrl(config.appUrl)}/login?nonce=${nonce}`;
+
+        // Open Redirect Protection: MUST start with the configured trusted App URL
+        const trustedAppOrigin = cleanUrl(config.appUrl);
+        if (!loginUrl.startsWith(trustedAppOrigin)) {
+            console.error('[SSO] Login URL does not match trusted App URL:', loginUrl);
+            return res.status(500).send('Invalid App URL: Origin mismatch');
+        }
+
+        res.redirect(loginUrl);
+
+    } catch (e: any) {
+        // BETERE ERROR LOGGING
+        console.error('❌ SSO CALLBACK ERROR:');
+        if (e.response) {
+            // Error kwam terug van de SSO provider (b.v. 400 Bad Request)
+            console.error(`Status: ${e.response.status}`);
+            console.error('Data:', JSON.stringify(e.response.data));
+        } else if (e.request) {
+            // Geen antwoord ontvangen (b.v. netwerk timeout / DNS fout)
+            console.error('Geen antwoord van SSO provider. Check netwerk/DNS/Docker link.');
+            console.error('Error details:', e.message);
+        } else {
+            // Code fout
+            console.error('Code Error:', e.message);
+        }
+        res.status(500).type('text/plain').send(`Login failed: ${e.message}`);
+    }
+});
+
+// SSO Token Exchange - Exchange nonce for JWT
+apiRouter.post('/auth/sso-exchange', async (req, res) => {
+    try {
+        const { nonce } = req.body;
+
+        if (!nonce || typeof nonce !== 'string') {
+            return res.status(400).json({ error: 'Nonce required' });
+        }
+
+        // Atomische operatie (Check & Delete in één keer)
+        const result = await pool.query(
+            'DELETE FROM sso_tokens WHERE nonce = $1 RETURNING token, user_data, expires_at',
+            [nonce]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid or expired nonce' });
+        }
+
+        let { token, user_data, expires_at } = result.rows[0];
+
+        // Decrypt token
+        try { token = decryptData(token); } catch (e) { return res.status(500).json({ error: 'Token decryption error' }); }
+
+        // Check expiration
+        if (new Date() > new Date(expires_at)) {
+            return res.status(401).json({ error: 'Nonce expired' });
+        }
+
+        // COOKIE INSTELLEN
+        const config = await getConfig();
+        const isProduction = process.env.NODE_ENV === 'production';
+        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+        res.cookie('token', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: isProduction ? 'strict' : 'lax',
+            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
+        });
+
+        res.json({ token, user: user_data });
+    } catch (e: any) {
+        console.error('[SSO Exchange Error]:', e.message);
+        res.status(500).json({ error: 'Token uitwisseling failed' });
+    }
+});
+
+// CONFIG OPHALEN
+apiRouter.get('/config', async (req, res) => {
+    try {
+        const config = await getConfig();
+        const authReq = req as AuthRequest;
+
+        const publicConfig = {
+            appName: config.appName,
+            logoUrl: config.logoUrl,
+            faviconUrl: config.faviconUrl,
+            ssoEnabled: config.ssoEnabled,
+            ssoAutoRedirect: config.ssoAutoRedirect,
+            ssoLogoutUrl: config.ssoLogoutUrl,
+            // Upload sizing (safe for guests/non-admin; used client-side for validation & chunking)
+            maxSizeVal: config.maxSizeVal,
+            maxSizeUnit: config.maxSizeUnit,
+            chunkSizeVal: config.chunkSizeVal,
+            chunkSizeUnit: config.chunkSizeUnit,
+            shareIdLength: config.shareIdLength,
+            // Voeg deze regels toe zodat de login pagina weet wat mag:
+            allowPasskeys: config.allowPasskeys,
+            allowPasswordReset: config.allowPasswordReset,
+            smtpConfigured: !!config.smtpHost, // Stuurt true/false i.p.v. de server gegevens
+            appLocale: config.appLocale || 'en-GB',
+            demoMode: DEMO_MODE,
+            ...(DEMO_MODE ? { demoDataRetentionMinutes: DEMO_RETENTION_MINUTES, demoMaxFileMb: DEMO_MAX_FILE_MB } : {})
+        };
+
+        const authConfig = {
+            ...publicConfig,
+            clamavEnabled: !!clamscanInstance,
+            clamavMustScan: isClamavScanEnforcedForApi(config),
+            clamavScanInternalShares: !!config.clamavScanInternalShares || DEMO_MODE,
+        };
+
+        const cookies = parseCookies(req);
+        const token = cookies.token || (authReq.headers['authorization'] && authReq.headers['authorization'].split(' ')[1]);
+
+        if (!token) return res.json(publicConfig);
+
+        jwt.verify(token!, JWT_SECRET!, (err: any, decoded: any) => {
+            if (err) return res.json(publicConfig);
+            if (decoded && decoded.isAdmin) {
+                // VEILIGHEIDS Maskeer geheimen voordat ze naar frontend gaan
+                const safeConfig = {
+                    ...config,
+                    demoMode: DEMO_MODE,
+                    clamavEnabled: !!clamscanInstance,
+                    clamavMustScan: isClamavScanEnforcedForApi(config),
+                    clamavScanInternalShares: !!config.clamavScanInternalShares || DEMO_MODE,
+                    ...(DEMO_MODE ? { demoDataRetentionMinutes: DEMO_RETENTION_MINUTES, demoMaxFileMb: DEMO_MAX_FILE_MB } : {})
+                };
+                if (safeConfig.smtpPass) safeConfig.smtpPass = '********';
+                if (safeConfig.oidcSecret) safeConfig.oidcSecret = '********';
+
+                res.json(safeConfig);
+            } else {
+                res.json(authConfig);
+            }
+        });
+    } catch (e) { res.status(500).json({ error: 'Config error' }); }
+});
+
+// SYSTEM BRANDING UPLOAD
+// Checkt: Mag dit verzoek? (Ja als setup nog niet klaar is, anders alleen Admin)
+const checkConfigPermission = async (req: Request, res: Response): Promise<boolean> => {
+    const config = await getConfig();
+    if (!config.setupCompleted) return true; // Setup mode: Alles mag
+
+    // Normale mode: Check Admin Token
+    const cookies = parseCookies(req);
+    const token = cookies.token || req.headers['authorization']?.split(' ')[1];
+    if (!token) { res.status(401).json({ error: 'Access denied' }); return false; }
+    try {
+        const decoded: any = jwt.verify(token, JWT_SECRET);
+        if (!decoded.isAdmin) { res.status(403).json({ error: 'Admin required' }); return false; }
+        (req as AuthRequest).user = decoded;
+        return true;
+    } catch (e) { res.status(403).json({ error: 'Invalid token' }); return false; }
+};
+
+// SYSTEM BRANDING UPLOAD
+apiRouter.post('/config/branding', uploadSystem.fields([{ name: 'logo', maxCount: 1 }, { name: 'favicon', maxCount: 1 }]), async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Branding upload is disabled in demo mode.' });
+    if (!await checkConfigPermission(req, res)) return;
+    try {
+        const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+        const currentConfig = await getConfig();
+
+        if (files.logo && files.logo[0]) currentConfig.logoUrl = `/api/uploads/system/${files.logo[0].filename}`;
+        if (files.favicon && files.favicon[0]) currentConfig.faviconUrl = `/api/uploads/system/${files.favicon[0].filename}`;
+
+        await pool.query('UPDATE config SET data = $1 WHERE id = 1', [currentConfig]);
+        invalidateConfigCache();
+        res.json({ success: true, logoUrl: currentConfig.logoUrl, faviconUrl: currentConfig.faviconUrl });
+    } catch (e: any) {
+        console.error('Branding upload error:', e);
+        res.status(500).json({ error: e.message || 'Upload failed' });
+    }
+});
+
+// CONFIG Save
+apiRouter.put('/config', async (req, res) => {
+    if (!await checkConfigPermission(req, res)) return;
+    const authReq = req as AuthRequest;
+    const newConfig = authReq.body;
+
+    // Security: Validate branding URLs to prevent XSS
+    for (const field of ['logoUrl', 'faviconUrl'] as const) {
+        const value = newConfig[field];
+        if (value && typeof value === 'string') {
+            const lower = value.toLowerCase().trim();
+            if (lower.startsWith('javascript:') || lower.startsWith('vbscript:') || lower.startsWith('data:')) {
+                return res.status(400).json({ error: `Invalid ${field}` });
+            }
+        }
+    }
+
+    try {
+        const currentConfig = await getConfig();
+
+        // MERGE: Start with current config to prevent data loss of missing fields
+        const finalConfig = { ...currentConfig, ...newConfig };
+
+        // Secrets Handling: Restore if empty/masked
+        if (!newConfig.smtpPass || newConfig.smtpPass === '********') {
+            finalConfig.smtpPass = currentConfig.smtpPass;
+        } else {
+            finalConfig.smtpPass = newConfig.smtpPass;
+        }
+
+        if (!newConfig.oidcSecret || newConfig.oidcSecret === '********') {
+            finalConfig.oidcSecret = currentConfig.oidcSecret;
+        } else {
+            finalConfig.oidcSecret = newConfig.oidcSecret;
+        }
+
+        // Ensure critical booleans are preserved/updated correctly
+        finalConfig.setup_completed = currentConfig.setupCompleted; // Never allow overwrite via API
+
+        if (DEMO_MODE) {
+            applyDemoSecurityPolicy(finalConfig);
+        }
+
+        await pool.query(
+            `INSERT INTO config (id, data, setup_completed) VALUES (1, $1, $2) 
+             ON CONFLICT (id) DO UPDATE SET data = $1`,
+            [finalConfig, currentConfig.setupCompleted || false]
+        );
+
+        invalidateConfigCache();
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Could not save config' });
+    }
+});
+
+// Markeer setup als voltooid
+apiRouter.post('/config/setup-complete', async (req, res) => {
+    if (!await checkConfigPermission(req, res)) return;
+    try {
+        await pool.query('UPDATE config SET setup_completed = TRUE WHERE id = 1');
+        invalidateConfigCache();
+        res.json({ success: true });
+    } catch (e: any) {
+        console.error('Setup complete error:', e);
+        res.status(500).json({ error: 'Failed to update setup status' });
+    }
+});
+
+// TEST EMAIL FUNCTIE
+apiRouter.post('/config/test-email', async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Test email is disabled in demo mode.' });
+    if (!await checkConfigPermission(req, res)) return;
+    try {
+        const { smtpHost, smtpPort, smtpUser, smtpPass, smtpSecure, testEmail, smtpFrom, smtpAllowLocal } = req.body;
+        if (!testEmail || typeof testEmail !== 'string') return res.status(400).json({ error: 'No test email address provided' });
+
+        const smtpHostStr = typeof smtpHost === 'string' ? smtpHost : '';
+        const smtpUserStr = typeof smtpUser === 'string' ? smtpUser : '';
+        const smtpFromStr = typeof smtpFrom === 'string' ? smtpFrom : '';
+        const smtpPortNum = typeof smtpPort === 'number' && Number.isFinite(smtpPort)
+            ? smtpPort
+            : parseInt(typeof smtpPort === 'string' ? smtpPort : '', 10);
+        if (!Number.isFinite(smtpPortNum) || smtpPortNum < 1 || smtpPortNum > 65535) {
+            return res.status(400).json({ error: 'Invalid SMTP port' });
+        }
+
+        if (!smtpAllowLocal && isPrivateIP(smtpHostStr)) {
+            return res.status(403).json({ error: 'Internal/Local IPs are blocked. Enable "Allow Local IPs" in settings if this is intentional.' });
+        }
+
+        let finalPass = smtpPass;
+        if (!finalPass || finalPass === '********') {
+            const currentConfig = await getConfig();
+            finalPass = currentConfig.smtpPass;
+        }
+
+        const transporter = nodemailer.createTransport(
+            createSmtpTransportOptions({
+                host: smtpHostStr,
+                port: smtpPortNum,
+                secure: !!smtpSecure,
+                auth: { user: smtpUserStr, pass: finalPass },
+            })
+        );
+
+        const config = await getConfig();
+        const fromAddr = smtpFromStr || smtpUserStr;
+        const appName = config.appName || 'Nexo Share';
+        const testSubject = `Test Email from ${appName}`;
+        const baseUrl = getBaseUrl(config);
+        const logoSrc = resolveEmailLogoSrc(config.logoUrl, baseUrl);
+        const html = buildEmailHtml({
+            appName,
+            subject: testSubject,
+            bodyHtml: `<p style="margin: 0 0 12px 0; color: #475569;">Your SMTP settings are correct. This message uses the same template as other Nexo Share emails.</p>`,
+            logoSrc,
+        });
+        await transporter.sendMail({
+            from: fromAddr.includes('<') ? fromAddr : `"${appName}" <${fromAddr}>`,
+            to: testEmail,
+            subject: testSubject,
+            html,
+        });
+        res.json({ success: true });
+    } catch (e: any) {
+        console.error('Test email error:', e);
+        const clientMsg = humanizeSmtpError(e);
+        const raw = String(e?.message || '');
+        const isAuthFail = /535|authentication failed|invalid credentials|bad username or password|invalid login/i.test(raw);
+        res.status(isAuthFail ? 401 : 502).json({ error: clientMsg });
+    }
+});
+
+/** Test whether the current admin would keep admin rights under proposed SSO admin groups. */
+apiRouter.post('/config/test-sso-admin-groups', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const authReq = req as AuthRequest;
+        const draftGroups = Array.isArray(req.body?.ssoAdminGroups)
+            ? req.body.ssoAdminGroups
+            : typeof req.body?.ssoAdminGroups === 'string'
+              ? req.body.ssoAdminGroups.split(/[\n,]+/)
+              : [];
+
+        const userRes = await pool.query(
+            'SELECT oidc_groups, oidc_groups_synced_at, is_admin, email FROM users WHERE id = $1',
+            [authReq.user!.id]
+        );
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const row = userRes.rows[0];
+        const synced = !!row.oidc_groups_synced_at;
+        let userGroups: string[] = [];
+        const raw = row.oidc_groups;
+        if (Array.isArray(raw)) {
+            userGroups = raw.map((g: unknown) => String(g).trim()).filter(Boolean);
+        } else if (typeof raw === 'string' && raw.trim()) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) {
+                    userGroups = parsed.map((g: unknown) => String(g).trim()).filter(Boolean);
+                }
+            } catch {
+                userGroups = [];
+            }
+        }
+
+        const result = userMatchesSsoAdminGroups(userGroups, draftGroups);
+
+        if (!result.configured) {
+            return res.json({
+                configured: false,
+                matches: true,
+                wouldRemainAdmin: true,
+                synced,
+                needsResync: false,
+                userGroups,
+                matchedGroups: [],
+                message:
+                    'No admin groups entered — group policy is off. Existing admin flags are left unchanged on SSO login.',
+            });
+        }
+
+        if (!synced) {
+            return res.json({
+                configured: true,
+                matches: false,
+                wouldRemainAdmin: false,
+                synced: false,
+                needsResync: true,
+                userGroups: [],
+                matchedGroups: [],
+                message: 'SSO group data is not synced for this session yet.',
+            });
+        }
+
+        if (userGroups.length === 0) {
+            return res.json({
+                configured: true,
+                matches: false,
+                wouldRemainAdmin: true,
+                synced: true,
+                needsResync: false,
+                userGroups: [],
+                matchedGroups: [],
+                message:
+                    'Your last SSO login returned no groups from the IdP. Admin flags stay unchanged when the groups claim is missing. Check the OIDC groups scope / claim mapping.',
+            });
+        }
+
+        return res.json({
+            configured: true,
+            matches: result.matches,
+            wouldRemainAdmin: result.matches,
+            synced: true,
+            needsResync: false,
+            userGroups,
+            matchedGroups: result.matchedGroups,
+            message: result.matches
+                ? `You match admin group(s): ${result.matchedGroups.join(', ')}. Safe to save — you keep admin on next SSO login.`
+                : `None of the listed names appear in your IdP groups (${userGroups.join(', ') || 'none'}). OIDC cannot tell typo from a real group you are not in — both demote you. If you save, your next SSO login removes admin rights.`,
+        });
+    } catch (e: any) {
+        console.error('test-sso-admin-groups error:', e);
+        res.status(500).json({ error: e.message || 'Test failed' });
+    }
+});
+
+// USERS
+apiRouter.get('/users', authenticateToken, requireAdmin, async (req, res) => {
+    const result = await pool.query('SELECT id, email, name, is_admin, created_at FROM users ORDER BY id ASC');
+    res.json(result.rows);
+});
+
+apiRouter.post('/users', async (req, res) => {
+    // SECURITY Allow creation without token ONLY if DB is empty (First Setup)
+    const countCheck = await pool.query('SELECT COUNT(*) FROM users');
+    const userCount = parseInt(countCheck.rows[0].count);
+
+    if (DEMO_MODE && userCount >= DEMO_MAX_USERS) {
+        return res.status(403).json({ error: `Demo mode: maximum ${DEMO_MAX_USERS} user account(s) allowed.` });
+    }
+
+    if (userCount > 0) {
+        // Normal flow: Check Token & Admin rights manually since we removed middleware
+        const cookies = parseCookies(req);
+        const token = cookies.token || req.headers['authorization']?.split(' ')[1];
+        if (!token) return res.status(401).json({ error: 'Access denied' });
+        try {
+            const decoded: any = jwt.verify(token, JWT_SECRET);
+            if (!decoded.isAdmin) return res.status(403).json({ error: 'Admin required' });
+            (req as AuthRequest).user = decoded;
+        } catch (e) { return res.status(403).json({ error: 'Invalid token' }); }
+    }
+
+    const { email, password, name, is_admin } = req.body;
+
+    // Validate email
+    if (!isValidEmail(email)) {
+        return res.status(400).json({ error: 'Invalid email address' });
+    }
+
+    // Validate password strength
+    const passwordCheck = isStrongPassword(password);
+    if (!passwordCheck.valid) {
+        return res.status(400).json({ error: passwordCheck.error });
+    }
+
+    const hash = await Bun.password.hash(password);
+    const effectiveIsAdmin = userCount === 0 ? true : !!is_admin;
+    try {
+        const result = await pool.query(
+            'INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4) RETURNING id',
+            [email, hash, name, effectiveIsAdmin]
+        );
+        await logAudit((req as AuthRequest).user?.id ?? null, 'user_created', 'user', result.rows[0].id.toString(), req, {
+            email,
+            is_admin: effectiveIsAdmin
+        });
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Could not create user' });
+    }
+});
+
+// --- 1. EERST de specifieke routes (Profile & Me) ---
+
+// USER - Get Own Profile
+apiRouter.get('/users/me', authenticateToken, async (req, res) => {
+    try {
+        const authReq = req as AuthRequest;
+        const result = await pool.query(
+            'SELECT id, email, name, is_admin, totp_enabled, created_at FROM users WHERE id = $1',
+            [authReq.user!.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.json(result.rows[0]);
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Profile retrieval failed' });
+    }
+});
+
+// USER - Update Own Profile
+apiRouter.put('/users/profile', authenticateToken, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: profile changes are disabled.' });
+    const authReq = req as AuthRequest;
+    const { email, password, name } = authReq.body;
+    const myId = authReq.user!.id;
+
+    // Validate email
+    if (!isValidEmail(email)) {
+        return res.status(400).json({ error: 'Invalid email address' });
+    }
+
+    let updates = [`name = $1`, `email = $2`];
+    let values = [name, email];
+    let i = 3;
+
+    if (password && typeof password === 'string' && password.trim() !== "") {
+        // Require Current Password
+        const { currentPassword } = authReq.body;
+        if (!currentPassword) return res.status(400).json({ error: 'Current password is required to change.' });
+
+        const userRes = await pool.query('SELECT password_hash FROM users WHERE id = $1', [myId]);
+        const valid = await Bun.password.verify(currentPassword, userRes.rows[0].password_hash);
+        if (!valid) return res.status(401).json({ error: 'Current password is wrong' });
+
+        // Validate password strength
+        const passwordCheck = isStrongPassword(password);
+        if (!passwordCheck.valid) {
+            return res.status(400).json({ error: passwordCheck.error });
+        }
+
+        const hash = await Bun.password.hash(password);
+        updates.push(`password_hash = $${i}`);
+        values.push(hash);
+        i++;
+    }
+
+    values.push(myId);
+
+    try {
+        // Nu klopt de nummering: $1, $2, ($3 Optional), en ID is de laatste
+        await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = $${i}`, values);
+
+        // Ververs het JWT Cookie met de nieuwe gegevens
+        const config = await getConfig();
+        const userRes = await pool.query('SELECT id, email, name, is_admin FROM users WHERE id = $1', [myId]);
+        const updatedUser = userRes.rows[0];
+
+        const token = jwt.sign(
+            { id: updatedUser.id, email: updatedUser.email, isAdmin: updatedUser.is_admin },
+            JWT_SECRET,
+            { expiresIn: getTimeInMs(config.sessionVal, config.sessionUnit) / 1000 }
+        );
+
+        const isProduction = process.env.NODE_ENV === 'production';
+        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+        res.cookie('token', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: isProduction ? 'strict' : 'lax',
+            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
+        });
+
+        res.json({ success: true, user: updatedUser });
+    } catch (e: any) {
+        if (e.code === '23505') {
+            return res.status(409).json({ error: 'This email address is already in use.' });
+        }
+        console.error(e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// USER - Delete Own Account
+apiRouter.delete('/users/me/delete', authenticateToken, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: account deletion is disabled.' });
+    try {
+        const authReq = req as AuthRequest;
+        const { password } = req.body;
+
+        // Verify password
+        const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [authReq.user!.id]);
+        const valid = await Bun.password.verify(password, result.rows[0].password_hash);
+
+        if (!valid) {
+            return res.status(401).json({ error: 'Incorrect Password' });
+        }
+
+        await logAudit(authReq.user!.id, 'self_delete', 'user', authReq.user!.id.toString(), req);
+        await pool.query('DELETE FROM users WHERE id = $1', [authReq.user!.id]);
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Deletion failed' });
+    }
+});
+
+// --- 2. DAARNA pas de generieke routes met :id (Admin Routes) ---
+
+// ADMIN - Update User
+apiRouter.put('/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: modifying users is disabled.' });
+    const authReq = req as AuthRequest;
+    const { email, password, name, is_admin } = authReq.body;
+    const targetId = authReq.params.id;
+
+    // Voorkom dat een admin zichzelf degradeert
+    if (parseInt(targetId) === authReq.user!.id && is_admin === false) {
+        return res.status(403).json({ error: 'You cannot remove your own admin privileges.' });
+    }
+
+    // Validate email
+    if (!isValidEmail(email)) {
+        return res.status(400).json({ error: 'Invalid email address' });
+    }
+
+    let updates = [`name = $1`, `email = $2`, `is_admin = $3`];
+    let values = [name, email, is_admin];
+    let i = 4;
+
+    if (password && typeof password === 'string' && password.trim() !== "") {
+        const passwordCheck = isStrongPassword(password);
+        if (!passwordCheck.valid) {
+            return res.status(400).json({ error: passwordCheck.error });
+        }
+
+        const hash = await Bun.password.hash(password);
+        updates.push(`password_hash = $${i}`);
+        values.push(hash);
+        i++;
+    }
+
+    values.push(targetId);
+
+    try {
+        await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = $${i}`, values);
+        res.json({ success: true });
+    } catch (e: any) {
+        if (e.code === '23505') {
+            return res.status(409).json({ error: 'This email address is already in use.' });
+        }
+        console.error(e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ADMIN - Delete User
+apiRouter.delete('/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+    if (DEMO_MODE) return res.status(403).json({ error: 'Demo mode: deleting users is disabled.' });
+    const userId = req.params.id;
+    const authReq = req as AuthRequest;
+
+    // Prevent self-delete via admin panel
+    if (authReq.user!.id === parseInt(userId)) {
+        return res.status(403).json({ error: 'Use profile options to delete yourself.' });
+    }
+
+    try {
+        // 1. Haal alle shares van deze gebruiker op
+        const userShares = await pool.query('SELECT id FROM shares WHERE user_id = $1', [userId]);
+
+        // 2. Verwijder fysieke mappen van deze shares
+        for (const row of userShares.rows) {
+            await fs.rm(path.join(UPLOAD_DIR, row.id), { recursive: true, force: true }).catch(() => { });
+        }
+
+        // 3. Verwijder gebruiker (Cascade zou shares/files uit DB moeten halen als FK goed staat, 
+        // maar voor de zekerheid doen we shares expliciet als je schema geen cascade heeft)
+        await pool.query('DELETE FROM shares WHERE user_id = $1', [userId]);
+        await pool.query('DELETE FROM reverse_shares WHERE user_id = $1', [userId]); // Ook reverse shares!
+        await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+
+        await logAudit(authReq.user!.id, 'user_deleted', 'user', userId, req);
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Server error while deleting user' });
+    }
+});
+
+apiRouter.get('/contacts', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const result = await pool.query('SELECT * FROM contacts WHERE user_id = $1 ORDER BY email ASC', [authReq.user!.id]);
+    res.json(result.rows);
+});
+apiRouter.delete('/contacts/:id', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    await pool.query('DELETE FROM contacts WHERE id = $1 AND user_id = $2', [authReq.params.id, authReq.user!.id]);
+    res.json({ success: true });
+});
+
+// CHUNKED UPLOAD ROUTES
+
+// STAP 1: Initialiseer de upload (Metadata Save)
+apiRouter.post('/shares/init', authenticateToken, uploadLimiter, handleUploadId, async (req, res) => {
+    const client = await pool.connect();
+    const authReq = req as AuthRequest;
+    try {
+        const { name, expirationVal, expirationUnit, recipients, message, password, maxDownloads } = authReq.body;
+        const shareId = authReq.uploadId!;
+
+        const passwordHash = password ? await Bun.password.hash(password) : null;
+        const config = await getConfig();
+
+        const maxShareBytes = getBytes(config.maxSizeVal || 10, config.maxSizeUnit || 'GB');
+        const rawTotal = (authReq.body as any).totalUploadBytes;
+        let totalUploadBytes: number;
+        if (rawTotal === undefined || rawTotal === null || rawTotal === '') {
+            totalUploadBytes = maxShareBytes; // legacy clients: geen sessie-totaal; server gebruikt max
+        } else {
+            totalUploadBytes = typeof rawTotal === 'number' && Number.isFinite(rawTotal)
+                ? rawTotal
+                : parseInt(String(rawTotal), 10);
+            if (!Number.isFinite(totalUploadBytes) || totalUploadBytes < 0) {
+                return res.status(400).json({ error: 'Invalid totalUploadBytes' });
+            }
+        }
+        if (totalUploadBytes > maxShareBytes) {
+            return res.status(413).json({ error: 'Total upload exceeds maximum share size.' });
+        }
+
+        const rawFileNames = (authReq.body as { fileNames?: unknown }).fileNames;
+        if (rawFileNames !== undefined && rawFileNames !== null) {
+            if (!Array.isArray(rawFileNames)) {
+                return res.status(400).json({ error: 'fileNames must be an array of strings' });
+            }
+            try {
+                assertUploadFileNamesAllowed(
+                    rawFileNames.map((n) => String(n)),
+                    config,
+                    'user'
+                );
+            } catch (e: any) {
+                return res.status(400).json({ error: e.message || 'File type not allowed' });
+            }
+        }
+
+        let expiresAt = null;
+
+        // 1. Definiëer unit (standaard uit config als niet meegegeven)
+        let unit = expirationUnit || config.defaultExpirationUnit;
+
+        let val;
+        // 2. Check of de gebruiker expliciet iets heeft meegestuurd (inclusief 0 of lege string)
+        if (expirationVal !== undefined && expirationVal !== null && expirationVal !== '') {
+            val = parseInt(expirationVal);
+
+            // Als parseInt faalt (bijv. lege string ""), maak er expliciet 0 van (Nooit)
+            if (isNaN(val)) val = 0;
+        } else {
+            // 3. Pas als er ÉCHT niets in het request zit, vallen we terug op de server default
+            val = config.defaultExpirationVal;
+        }
+
+        // Check Max Expiration Limiet (als die is ingesteld op > 0)
+        if (config.maxExpirationVal > 0) {
+            const reqMs = getTimeInMs(val, unit);
+            const maxMs = getTimeInMs(config.maxExpirationVal, config.maxExpirationUnit);
+            if (reqMs > maxMs) {
+                // Als de gevraagde tijd langer is dan max, cap hem op max
+                val = config.maxExpirationVal;
+                unit = config.maxExpirationUnit;
+            }
+        }
+
+        // Als val > 0, bereken de datum. Zo niet (0), dan verloopt hij nooit.
+        if (val > 0) {
+            expiresAt = new Date(Date.now() + getTimeInMs(val, unit));
+        }
+
+        try {
+            await client.query(`INSERT INTO shares (id, user_id, name, password_hash, expires_at, recipients, message, max_downloads) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [shareId, authReq.user!.id, name || 'Share', passwordHash, expiresAt, recipients, message, maxDownloads || null]);
+        } catch (err: any) {
+            // Check voor Postgres Unique Violation error code (23505)
+            if (err.code === '23505') {
+                return res.status(409).json({ error: 'This ID/Link is already in use. Please try another.' });
+            }
+            throw err;
+        }
+
+        // Maak alvast de map aan
+        const shareDir = path.join(UPLOAD_DIR, shareId);
+        await fs.mkdir(shareDir, { recursive: true });
+
+        clearUploadSessionKeys(shareId);
+        uploadSessionBudget.set(shareId, totalUploadBytes);
+        uploadSessionBytesUsed.set(shareId, 0);
+
+        res.json({ success: true, shareId });
+    } catch (e: any) {
+        console.error('Init failed:', e);
+        res.status(500).json({ error: e.message || 'Initialization failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// STAP 2: Upload een chunk (stukje bestand)
+// We zetten de limiet hier ruim (500MB), de echte beperking wordt bepaald door
+// de chunk-grootte die de frontend hanteert (via config) en de Cloudflare limiet.
+const chunkStorage = multer.diskStorage({
+    destination: TEMP_DIR,
+    filename: (req, file, cb) => {
+        // Sla de chunk op met een willekeurige naam
+        cb(null, `chunk_${crypto.randomBytes(8).toString('hex')}`);
+    }
+});
+
+// 1. Authenticated Uploads (Alles toegestaan, want gebruiker is vertrouwd)
+const CHUNK_BODY_LIMIT = DEMO_MODE ? getBytes(DEMO_MAX_FILE_MB, 'MB') : 500 * 1024 * 1024;
+
+/** Reject blocked types using logical file name (req.body.fileName), not multer chunk field name. */
+async function rejectBlockedUploadFilename(
+    fileName: unknown,
+    audience: 'user' | 'guest',
+    res: Response,
+    tempChunkPath?: string
+): Promise<boolean> {
+    const config = await getConfig();
+    const blocklist = getUploadBlocklist(config, audience);
+    const safeName = typeof fileName === 'string' ? fileName : '';
+    const reason = getBlockedFilenameReason(safeName, blocklist);
+    if (!reason) return false;
+    if (tempChunkPath) await safeUnlink(tempChunkPath);
+    res.status(400).json({ error: reason });
+    return true;
+}
+
+const chunkUploadAuth = multer({
+    storage: chunkStorage,
+    limits: { fileSize: CHUNK_BODY_LIMIT, files: 1 },
+});
+
+const chunkUploadPublic = multer({
+    storage: chunkStorage,
+    limits: { fileSize: CHUNK_BODY_LIMIT, files: 1 },
+});
+
+apiRouter.post('/shares/:id/chunk', authenticateToken, uploadLimiter, chunkUploadAuth.single('chunk'), async (req, res) => {
+    const { id } = req.params;
+
+    // Security: Validate ID format before touching FS
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid Share ID format' });
+
+    const { fileName, chunkIndex, fileId, chunkHash } = req.body;
+    if (!isValidId(fileId)) return res.status(400).json({ error: 'Invalid File ID format' });
+
+    if (!req.file) return res.status(400).json({ error: 'No data' });
+
+    if (!isPathUnderDir(TEMP_DIR, req.file.path)) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid upload path' });
+    }
+
+    // UNIEKE NAAM: Opslaan als .part bestand (één bestand dat groeit)
+    const safeFileName = safeUploadBaseName(fileName);
+    if (!safeFileName) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid file name' });
+    }
+    if (await rejectBlockedUploadFilename(fileName, 'user', res, req.file.path)) return;
+
+    const partFilePath = path.join(TEMP_DIR, `${id}_${fileId}_${safeFileName}.part`);
+    if (!isResolvedPathInsideDir(TEMP_DIR, partFilePath)) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid path' });
+    }
+
+    try {
+        const config = await getConfig();
+        const maxBytes = getBytes(config.maxSizeVal || 10, config.maxSizeUnit || 'GB');
+
+        const chunkIdx = parseInt(String(chunkIndex), 10);
+        if (!Number.isFinite(chunkIdx) || chunkIdx < 0) {
+            await safeUnlink(req.file.path);
+            return res.status(400).json({ error: 'Invalid chunk index' });
+        }
+
+        const chunkData = await fs.readFile(req.file.path);
+        const chunkLen = chunkData.length;
+
+        const chunkHashStr = typeof chunkHash === 'string' ? chunkHash : '';
+        if (chunkHashStr) {
+            if (!/^[a-fA-F0-9]{64}$/.test(chunkHashStr)) {
+                await safeUnlink(req.file.path);
+                return res.status(400).json({ error: 'Invalid chunk hash format' });
+            }
+
+            const crypto = await import('crypto');
+            const hash = crypto.createHash('sha256').update(chunkData).digest('hex');
+
+            if (hash !== chunkHashStr.toLowerCase()) {
+                await safeUnlink(req.file.path);
+                return res.status(400).json({ error: 'Chunk hash mismatch - data corruption detected' });
+            }
+        }
+
+        const sizeMap: any = { 'KB': 1024, 'MB': 1024 * 1024, 'GB': 1024 * 1024 * 1024, 'TB': 1024 * 1024 * 1024 * 1024 };
+        const defaultChunkSize = (config.chunkSizeVal || 20) * (sizeMap[config.chunkSizeUnit || 'MB'] || sizeMap['MB']);
+        const chunkSize = parseInt(req.headers['x-chunk-size'] as string) || defaultChunkSize;
+
+        const budget = uploadSessionBudget.get(id);
+        const countedKey = chunkBudgetKey(String(fileId), chunkIdx);
+        let countedSet = uploadSessionCountedChunks.get(id);
+        const alreadyCounted = !!countedSet?.has(countedKey);
+
+        if (budget !== undefined && !alreadyCounted) {
+            const used = uploadSessionBytesUsed.get(id) || 0;
+            if (used + chunkLen > budget) {
+                await safeUnlink(req.file.path);
+                return res.status(413).json({ error: 'Upload exceeds declared session size.' });
+            }
+        } else if (budget === undefined && chunkIdx === 0) {
+            const usageRes = await pool.query('SELECT COALESCE(SUM(size), 0) as total FROM files WHERE share_id = $1', [id]);
+            const currentTotal = parseInt(usageRes.rows[0].total);
+            if (currentTotal + chunkLen > maxBytes) {
+                await safeUnlink(req.file.path);
+                return res.status(413).json({ error: `Share limit exceeded.` });
+            }
+        }
+
+        if (chunkIdx > 0) {
+            try {
+                await fs.access(partFilePath);
+            } catch {
+                await safeUnlink(req.file.path);
+                return res.status(400).json({ error: 'Upload chunk 0 before later chunks for each file.' });
+            }
+        }
+
+        const totalFileSizeRaw = (req.body as any).totalFileSize;
+        const totalFileSize = typeof totalFileSizeRaw === 'number' && Number.isFinite(totalFileSizeRaw)
+            ? totalFileSizeRaw
+            : parseInt(String(totalFileSizeRaw ?? ''), 10);
+
+        if (chunkIdx === 0) {
+            await safeUnlink(partFilePath);
+            if (Number.isFinite(totalFileSize) && totalFileSize > 0 && totalFileSize <= maxBytes) {
+                await fs.writeFile(partFilePath, Buffer.alloc(0));
+                await fs.truncate(partFilePath, totalFileSize);
+            }
+        }
+
+        const offset = chunkIdx * chunkSize;
+        
+        try {
+            // Use write with offset for parallel-safe writes
+            const { createWriteStream } = await import('fs');
+            await new Promise<void>((resolve, reject) => {
+                const stream = createWriteStream(partFilePath, { 
+                    flags: 'r+',
+                    start: offset 
+                });
+                stream.on('error', reject);
+                stream.on('finish', resolve);
+                stream.end(chunkData);
+            });
+        } catch {
+            // File might not exist yet, create with offset
+            const { createWriteStream } = await import('fs');
+            await new Promise<void>((resolve, reject) => {
+                const stream = createWriteStream(partFilePath, { 
+                    flags: 'w',
+                    start: offset 
+                });
+                stream.on('error', reject);
+                stream.on('finish', resolve);
+                stream.end(chunkData);
+            });
+        }
+
+        await safeUnlink(req.file.path);
+
+        if (budget !== undefined && !alreadyCounted) {
+            if (!countedSet) {
+                countedSet = new Set<string>();
+                uploadSessionCountedChunks.set(id, countedSet);
+            }
+            countedSet.add(countedKey);
+            uploadSessionBytesUsed.set(id, (uploadSessionBytesUsed.get(id) || 0) + chunkLen);
+        }
+
+        res.json({ success: true, chunkIndex: chunkIdx, duplicate: alreadyCounted });
+    } catch (e) {
+        if (req.file) await safeUnlink(req.file.path);
+        console.error('Chunk error:', e);
+        res.status(500).json({ error: 'Chunk write failed' });
+    }
+});
+
+// STAP 3: Finalize (Verplaatsen, Scannen, Database, Email)
+apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (req, res) => {
+    const { id } = req.params;
+
+    // Security: Validate ID format
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid Share ID format' });
+
+    const { files } = req.body;
+    if (!Array.isArray(files)) return res.status(400).json({ error: 'Invalid files data' });
+    
+    // If no files (all cancelled), delete the share and return
+    if (files.length === 0) {
+        clearUploadSessionKeys(id);
+        await unlinkTempPartFilesForShare(id);
+        await pool.query('DELETE FROM shares WHERE id = $1', [id]);
+        return res.json({ success: true, empty: true, shareUrl: null });
+    }
+    
+    for (const f of files) {
+        if (!isValidId(f.fileId)) return res.status(400).json({ error: 'Invalid File ID format' });
+    }
+    const authReq = req as AuthRequest;
+
+    const client = await pool.connect();
+    const movedStoragePaths: string[] = [];
+    let transactionCommitted = false;
+
+    try {
+        const config = await getConfig();
+        try {
+            assertUploadFileNamesAllowed(
+                files.map((f: { fileName?: string; originalName?: string }) => f.fileName || f.originalName || ''),
+                config,
+                'user'
+            );
+        } catch (extErr: any) {
+            await unlinkTempPartFilesForShare(id);
+            return res.status(400).json({ error: extErr.message || 'File type not allowed' });
+        }
+
+        const shareDir = path.join(UPLOAD_DIR, id);
+
+        const checkOwner = await client.query('SELECT user_id FROM shares WHERE id = $1', [id]);
+        if (checkOwner.rows.length === 0) throw new Error('Share not found');
+        if (checkOwner.rows[0].user_id !== authReq.user!.id) throw new Error('Access denied');
+
+        // Idempotent: if a prior finalize committed but the client saw 502/504, return success.
+        const existingFiles = await client.query(
+            'SELECT COUNT(*)::int AS c FROM files WHERE share_id = $1',
+            [id]
+        );
+        if ((existingFiles.rows[0]?.c || 0) >= files.length) {
+            clearUploadSessionKeys(id);
+            await unlinkTempPartFilesForShare(id);
+            return res.json({
+                success: true,
+                shareUrl: `${config.appUrl || 'http://localhost:5173'}/s/${id}`,
+                alreadyFinalized: true,
+                recipientsNotified: false
+            });
+        }
+
+        const declaredTotal = files.reduce((acc: number, f: any) => acc + (Number(f.size) || 0), 0);
+        const sessionBudget = uploadSessionBudget.get(id);
+        if (sessionBudget !== undefined && declaredTotal > sessionBudget) {
+            throw new Error('Declared file sizes exceed upload session budget.');
+        }
+
+        await client.query('BEGIN');
+
+        for (const f of files) {
+            const safeFileName = safeUploadBaseName(f.fileName);
+            if (!safeFileName) throw new Error(`Invalid file name for ${f.originalName || 'upload'}`);
+            const safeExtension = path.extname(safeFileName);
+            const finalPath = path.join(shareDir, crypto.randomBytes(8).toString('hex') + safeExtension);
+
+            // Incremental Upload: Bestand is compleet in .part bestand
+            const partPath = path.join(TEMP_DIR, `${id}_${f.fileId}_${safeFileName}.part`);
+            if (!isResolvedPathInsideDir(TEMP_DIR, partPath) || !isResolvedPathInsideDir(path.resolve(UPLOAD_DIR), finalPath)) {
+                throw new Error('Security error: invalid storage path');
+            }
+
+            // Scan the .part first so a timeout/failure leaves chunks retryable.
+            await scanPathWithClamav({
+                filePath: partPath,
+                displayName: f.originalName,
+                fileSizeBytes: f.size,
+                config,
+                demoMode: DEMO_MODE,
+                scanContext: 'internal',
+                clamscanInstance,
+                unlink: safeUnlink,
+                messages: SCAN_MESSAGES_FINALIZE,
+                scanTimeoutMs: CLAMAV_TIMEOUT_MS,
+            });
+
+            try {
+                await fs.rename(partPath, finalPath);
+                movedStoragePaths.push(finalPath);
+            } catch (e: any) {
+                console.error(`Finalize error for`, f.fileName, ':', e);
+                if (e.code === 'ENOENT') {
+                    throw new Error(`Upload incomplete - chunk(s) missing for ${f.originalName}`);
+                }
+                throw new Error(`Upload failed processing ${f.originalName}: ${e.message}`);
+            }
+
+            const safeOriginalName = sanitizeFilename(f.originalName);
+            await client.query(`INSERT INTO files (share_id, filename, original_name, size, mime_type, storage_path) VALUES ($1, $2, $3, $4, $5, $6)`,
+                [id, path.basename(finalPath), safeOriginalName, f.size, f.mimeType, finalPath]);
+        }
+
+        const shareRes = await client.query('SELECT * FROM shares WHERE id = $1', [id]);
+        const share = shareRes.rows[0];
+
+        await client.query('COMMIT');
+        transactionCommitted = true;
+
+        clearUploadSessionKeys(id);
+        await unlinkTempPartFilesForShare(id);
+
+        let recipientsNotified = false;
+        // Emails
+        if (share.recipients) {
+            try {
+                const list = validateAndSplitEmails(share.recipients);
+                const baseUrl = getBaseUrl(config, req);
+                const url = `${baseUrl}/s/${id}`;
+                for (const email of list) {
+                    await pool.query(`INSERT INTO contacts (user_id, email) VALUES ($1, $2) ON CONFLICT (user_id, email) DO NOTHING`, [authReq.user!.id, email]);
+                    const sent = await sendEmail(email, 'Files received',
+                        `<p><strong>${escapeHtml(authReq.user!.email)}</strong> shared files with you.</p>
+                        <div class="message-box" style="${EMAIL_MESSAGE_BOX_STYLE}">
+                        ${share.message ? escapeHtml(share.message).replace(/\n/g, '<br>') : 'No message was added.'}
+                        </div>`, url, 'Download Files');
+                    if (sent) recipientsNotified = true;
+                }
+            } catch (mailErr) { console.error("Email failed:", mailErr); }
+        }
+
+        await logAudit(authReq.user!.id, 'share_created', 'share', id, req, { fileCount: files.length });
+        void triggerPrezip('share', id);
+        res.json({
+            success: true,
+            shareUrl: `${config.appUrl || 'http://localhost:5173'}/s/${id}`,
+            recipientsNotified
+        });
+
+    } catch (e: any) {
+        try { await client.query('ROLLBACK'); } catch { /* noop */ }
+        const msg = e?.message || 'Finalize failed';
+        if (!transactionCommitted) {
+            for (const p of movedStoragePaths) {
+                await safeUnlink(p);
+            }
+            // Keep .part files on retryable scan failures so the client can finalize again.
+            if (!/timed out|try again|unavailable/i.test(msg)) {
+                await unlinkTempPartFilesForShare(id);
+            }
+        }
+        console.error('Finalize error:', e);
+        let status = 500;
+        if (/virus detected|virus in /i.test(msg)) status = 400;
+        else if (/timed out|unavailable|try again/i.test(msg)) status = 503;
+        res.status(status).json({ error: msg });
+    } finally {
+        client.release();
+    }
+});
+
+apiRouter.put('/shares/:id', authenticateToken, uploadLimiter, checkUploadLimits, upload.array('files'), handleUploadId, async (req, res) => {
+    const client = await pool.connect();
+    const authReq = req as AuthRequest;
+    try {
+        const { name, expiration, password, customSlug, remove_password, staged_files } = authReq.body; // remove_password en staged_files toegevoegd
+        const currentId = authReq.params.id;
+
+        // --- SCAN FILES ---
+        if (authReq.files) {
+            await scanFiles(authReq.files as Express.Multer.File[]);
+        }
+
+        // --- PROCESS STAGED FILES ---
+        const processedStagedFiles = [];
+        if (staged_files && Array.isArray(staged_files)) {
+            // Dit zijn bestandsnamen in TEMP_DIR die we moeten moven naar share map
+        }
+
+        let newId = currentId;
+        if (customSlug && customSlug !== currentId) {
+            if (!isValidSlug(customSlug)) return res.status(400).json({ error: 'Invalid characters in link.' });
+            const check = await client.query('SELECT id FROM shares WHERE id = $1', [customSlug]);
+            if (check.rows.length > 0) return res.status(409).json({ error: 'Link is already in use' });
+            newId = customSlug;
+        }
+
+        if (newId !== currentId && uploadSessionBudget.has(currentId)) {
+            return res.status(409).json({
+                error: 'Cannot change the share link while a file upload is still in progress for this share. Wait until the upload finishes.'
+            });
+        }
+
+        const updates = [];
+        let values = [];
+        let i = 1;
+
+        if (name !== undefined) {
+            updates.push(`name = $${i++}`);
+            values.push(name);
+        }
+
+        if (remove_password === 'true' || remove_password === true) {
+            // Password verwijderen
+            updates.push(`password_hash = NULL`);
+        } else if (password && typeof password === 'string' && password.trim() !== '') {
+            // Nieuw Password instellen
+            const hash = await Bun.password.hash(password);
+            updates.push(`password_hash = $${i++}`);
+            values.push(hash);
+        }
+
+        if (authReq.body.expirationVal !== undefined && authReq.body.expirationVal !== null) {
+            let val = parseInt(authReq.body.expirationVal);
+
+            // BELANGRIJK: Als parseInt failed (bijv. lege string) of waarde is 0 -> Maak er 0 van.
+            if (isNaN(val)) val = 0;
+
+            const unit = authReq.body.expirationUnit || 'Days';
+
+            // Als val > 0 is, bereken datum. Als val 0 is, wordt het NULL (Nooit verlopen).
+            // We gebruiken hier GEEN config fallback, want bij een edit is 0 = oneindig.
+            const date = val > 0 ? new Date(Date.now() + getTimeInMs(val, unit)) : null;
+
+            updates.push(`expires_at = $${i++}`);
+            values.push(date);
+        }
+
+        if (authReq.body.maxDownloads !== undefined) {
+            const raw = authReq.body.maxDownloads;
+            const maxDl =
+                raw === '' || raw === null || raw === undefined
+                    ? null
+                    : parseInt(String(raw), 10);
+            updates.push(`max_downloads = $${i++}`);
+            values.push(maxDl != null && Number.isFinite(maxDl) && maxDl > 0 ? maxDl : null);
+        }
+
+        await client.query('BEGIN');
+
+        // Als het ID verandert, hernoem de map en update paden
+        if (newId !== currentId) {
+            const oldPath = path.join(UPLOAD_DIR, currentId);
+            const newPath = path.join(UPLOAD_DIR, newId);
+
+            try {
+                // 1. Probeer de map te hernoemen
+                await fs.access(oldPath); // Check of map bestaat
+                await fs.rename(oldPath, newPath);
+
+                // 2. Update de fysieke paden in de database voor alle bestanden in deze share
+                // We vervangen het oude pad-deel door het nieuwe pad-deel
+                await client.query(
+                    `UPDATE files SET storage_path = REPLACE(storage_path, $1, $2) WHERE share_id = $3`,
+                    [oldPath, newPath, currentId]
+                );
+            } catch (err: any) {
+                // Negeer error als map niet bestaat (lege share), anders loggen
+                if (err.code !== 'ENOENT') console.error('Fout bij hernoemen map:', err);
+            }
+        }
+
+        if (updates.length > 0) {
+            values.push(currentId);
+            values.push(authReq.user!.id);
+            // Let op: index i en i+1 gebruiken voor WHERE clause
+            await client.query(`UPDATE shares SET ${updates.join(', ')} WHERE id = $${i++} AND user_id = $${i++}`, values);
+        }
+
+        if (authReq.files && (authReq.files as any).length > 0) {
+            for (const file of (authReq.files as Express.Multer.File[])) {
+                await client.query(`INSERT INTO files (share_id, filename, original_name, size, mime_type, storage_path) VALUES ($1, $2, $3, $4, $5, $6)`, [newId, file.filename, file.originalname, file.size, file.mimetype, file.path]);
+            }
+        }
+
+        // Process Staged Files
+        let stagedList: any[] = [];
+        if (staged_files) {
+            if (typeof staged_files === 'string') {
+                try { stagedList = JSON.parse(staged_files); } catch { }
+            } else if (Array.isArray(staged_files)) {
+                stagedList = staged_files;
+            }
+        }
+
+        if (stagedList.length > 0) {
+            const shareDir = path.join(UPLOAD_DIR, newId);
+            // Zorg dat map bestaat
+            await fs.mkdir(shareDir, { recursive: true }).catch(() => { });
+
+            for (const sFile of stagedList) {
+                if (!sFile.tempId || !sFile.originalName) continue;
+
+                // Security check path traversal
+                if (path.basename(sFile.tempId) !== sFile.tempId) continue;
+
+                const sourcePath = path.join(TEMP_DIR, sFile.tempId);
+                if (!isResolvedPathInsideDir(TEMP_DIR, sourcePath)) continue;
+
+                const safeExt = path.extname(sFile.originalName);
+                const finalName = crypto.randomBytes(8).toString('hex') + safeExt;
+                const destPath = path.join(shareDir, finalName);
+
+                try {
+                    await fs.rename(sourcePath, destPath);
+
+                    // Insert DB
+                    const safeOriginalName = sanitizeFilename(sFile.originalName);
+                    await client.query(`INSERT INTO files (share_id, filename, original_name, size, mime_type, storage_path) VALUES ($1, $2, $3, $4, $5, $6)`,
+                        [newId, finalName, safeOriginalName, sFile.size, sFile.mimeType, destPath]);
+
+                } catch (e) {
+                    console.error('Failed to move staged file', sFile.tempId, e);
+                }
+            }
+        }
+
+        await client.query('COMMIT');
+
+        const filesAdded =
+            (authReq.files && (authReq.files as Express.Multer.File[]).length > 0) || stagedList.length > 0;
+        const metaChanged =
+            authReq.body.expirationVal !== undefined || authReq.body.maxDownloads !== undefined;
+        if (newId !== currentId) {
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', currentId);
+        }
+        if (filesAdded || metaChanged) {
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', newId);
+            void triggerPrezip('share', newId);
+        }
+
+        res.json({ success: true, newId });
+    } catch (e: any) {
+        await client.query('ROLLBACK');
+        if (authReq.files && Array.isArray(authReq.files)) {
+            for (const f of authReq.files as Express.Multer.File[]) {
+                // We proberen elk geüpload bestand direct weer te verwijderen
+                await safeUnlink(f.path);
+            }
+        }
+        console.error('Share update error:', e);
+        // We lekken alleen de error als het een bewuste validatie/virus error is
+        const isSafeError = e.message.includes('Security error') || e.message.includes('Link is already in use') || e.message.includes('Virus');
+
+        res.status(isSafeError ? 400 : 500).json({
+            error: isSafeError ? e.message : 'An internal error occurred while updating.'
+        });
+    } finally {
+        client.release();
+    }
+});
+
+apiRouter.get('/shares', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const config = await getConfig();
+    const baseUrl = config.appUrl || process.env.FRONTEND_URL || 'http://localhost:5173';
+    const result = await pool.query(`SELECT s.*, (SELECT json_agg(f.*) FROM files f WHERE f.share_id = s.id) as files, (SELECT SUM(size) FROM files WHERE share_id = s.id) as total_size FROM shares s WHERE s.user_id = $1 ORDER BY created_at DESC`, [authReq.user!.id]);
+    res.json(result.rows.map(r => ({ ...r, url: `${baseUrl}/s/${r.id}`, protected: !!r.password_hash })));
+});
+
+apiRouter.post('/shares/:id/resend', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const { recipients, message } = authReq.body;
+    const share = await pool.query('SELECT * FROM shares WHERE id = $1 AND user_id = $2', [authReq.params.id, authReq.user!.id]);
+    if (share.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const config = await getConfig();
+    const baseUrl = config.appUrl || process.env.FRONTEND_URL || 'http://localhost:5173';
+    const shareUrl = `${baseUrl}/s/${authReq.params.id}`;
+
+    if (recipients) {
+        const list = validateAndSplitEmails(recipients);
+        if (list.length === 0 && typeof recipients === 'string' && recipients.trim().length > 0) {
+            return res.status(400).json({ error: 'No valid email addresses found' });
+        }
+        // Try/Catch om crash te voorkomen bij SMTP errors
+        try {
+            for (const email of list) await sendEmail(email, 'Reminder: Files received', `<p><strong>${escapeHtml(authReq.user!.email)}</strong> sent the link again.</p><div class="message-box" style="${EMAIL_MESSAGE_BOX_STYLE}">${message ? escapeHtml(message).replace(/\n/g, '<br>') : 'Here is the link.'}</div>`, shareUrl, 'Download Files');
+        } catch (e: any) {
+            console.error("Resend email failed:", e.message);
+            res.status(500).json({ error: e.message || 'Failed to resend email' });
+        }
+    }
+    res.json({ success: true });
+});
+
+
+// STAGE: Bestanden samenvoegen in TEMP maar nog niet aan share koppelen (preview mogelijk maken)
+apiRouter.post('/shares/:id/stage', authenticateToken, uploadLimiter, async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid Share ID format' });
+    const { files } = req.body; // Array of {fileName, fileId, size, mimeType}
+    if (!Array.isArray(files) || files.length === 0) {
+        return res.status(400).json({ error: 'Invalid or empty files data' });
+    }
+
+    // We gebruiken hier GEEN DB transactie of cleaning, want het is temporary.
+    // De 'cleanup' job verwijdert oude meuk uit temp wel.
+
+    const stagedFiles = [];
+
+    try {
+        const config = await getConfig();
+        try {
+            assertUploadFileNamesAllowed(
+                files.map((f: { fileName?: string }) => f.fileName || ''),
+                config,
+                'user'
+            );
+        } catch (extErr: any) {
+            await unlinkTempPartFilesForShare(id);
+            return res.status(400).json({ error: extErr.message || 'File type not allowed' });
+        }
+
+        for (const f of files) {
+            if (!isValidId(f.fileId)) {
+                console.error(`Invalid fileId in stage: ${f.fileId}`);
+                continue; // Skip invalid files
+            }
+
+            const safeFileName = safeUploadBaseName(f.fileName);
+            if (!safeFileName) {
+                console.error(`Invalid fileName in stage: ${f.fileName}`);
+                continue;
+            }
+            // SECURITY: Generate a random ID to prevent file prediction/enumeration
+            const randomId = crypto.randomBytes(16).toString('hex');
+            const safeExt = path.extname(safeFileName);
+
+            // We slaan op als staged_{randomId}{ext}
+            const stagedName = `staged_${randomId}${safeExt}`;
+            const finalPath = path.join(TEMP_DIR, stagedName);
+
+            // Zelfde als POST /shares/:id/chunk + finalize: één bestand …/id_fileId_name.part (geen mergeChunks .part_0/.part_1)
+            const partPath = path.join(TEMP_DIR, `${id}_${f.fileId}_${safeFileName}.part`);
+            if (!isResolvedPathInsideDir(TEMP_DIR, partPath) || !isResolvedPathInsideDir(TEMP_DIR, finalPath)) {
+                throw new Error('Invalid temp path');
+            }
+            try {
+                await fs.access(partPath);
+            } catch {
+                throw new Error(`Missing upload data for "${f.fileName}". Upload incomplete.`);
+            }
+            try {
+                await fs.rename(partPath, finalPath);
+            } catch (e: any) {
+                throw new Error(`Failed to stage "${f.fileName}": ${e.message || 'rename failed'}`);
+            }
+
+            await scanPathWithClamav({
+                filePath: finalPath,
+                displayName: f.fileName,
+                fileSizeBytes: f.size,
+                config,
+                demoMode: DEMO_MODE,
+                scanContext: 'internal',
+                clamscanInstance,
+                unlink: safeUnlink,
+                messages: SCAN_MESSAGES_STAGED,
+                scanTimeoutMs: CLAMAV_TIMEOUT_MS,
+            });
+
+            stagedFiles.push({
+                tempId: stagedName,
+                originalName: f.fileName,
+                size: f.size,
+                mimeType: f.mimeType
+            });
+        }
+
+        res.json({ success: true, stagedFiles });
+    } catch (e: any) {
+        console.error('Stage error:', e);
+        res.status(500).json({ error: e.message || 'Staging failed' });
+    }
+});
+
+// PREVIEW STAGED FILE
+apiRouter.get('/shares/preview-stage/:tempId', authenticateToken, downloadLimiter, async (req, res) => {
+    const { tempId } = req.params;
+
+    // Security check: tempId regex validation (staged_HEX.ext)
+    const tempIdRegex = /^staged_[a-f0-9]{32}(\.[a-zA-Z0-9]+)?$/;
+    if (!tempId || !tempIdRegex.test(tempId)) {
+        return res.status(403).send('Invalid file');
+    }
+
+    const filePath = path.join(TEMP_DIR, tempId);
+
+    // Extra path traversal check
+    if (!path.resolve(filePath).startsWith(path.resolve(TEMP_DIR))) {
+        return res.status(403).send('Invalid path');
+    }
+    try {
+        await fs.access(filePath);
+
+        // Force download for dangerous types (XSS prevention)
+        const ext = path.extname(tempId).toLowerCase();
+        const dangerousTypes = ['.html', '.htm', '.xhtml', '.svg', '.xml', '.php'];
+
+        if (dangerousTypes.includes(ext)) {
+            return res.status(403).send('Preview not allowed for this file type');
+        }
+
+        res.sendFile(filePath);
+    } catch {
+        res.status(404).send('File not found or expired');
+    }
+});
+
+apiRouter.get('/shares/:id/download', downloadLimiter, async (req, res) => {
+    // 1. Queue Beheer
+    try { await zipQueue.wait(); } catch (e) { return res.status(503).send('Server too busy.'); }
+
+    let released = false;
+    const release = () => { if (!released) { released = true; zipQueue.release(); } };
+    res.on('finish', release); res.on('close', release); res.on('error', release);
+
+    try {
+        const config = await getConfig();
+        const { id } = req.params;
+        const dlCookieName = `dl_${id}`; // Cookie voor teller
+        const authCookieName = `share_auth_${id}`; // Cookie voor beveiliging
+        const cookies = parseCookies(req);
+
+        // 2. Haal share info op inclusief password_hash
+        const shareCheck = await pool.query(
+            'SELECT max_downloads, download_count, expires_at, password_hash FROM shares WHERE id = $1',
+            [id]
+        );
+
+        if (shareCheck.rows.length === 0) { release(); return res.status(404).send('Share not found'); }
+        const share = shareCheck.rows[0];
+
+        // 3. BEVEILIGINGS CHECK: Als er een wachtwoord op zit, check het cookie
+        if (share.password_hash) {
+            const authCookie = cookies[authCookieName];
+            if (!authCookie) { release(); return res.status(403).send('Access Denied: Password required.'); }
+
+            try {
+                const decoded: any = jwt.verify(authCookie, JWT_SECRET);
+                if (decoded.shareId !== id) throw new Error('Mismatch');
+            } catch (e) {
+                release(); return res.status(403).send('Access Denied: Session expired or invalid.');
+            }
+        }
+
+        // 4. Expiratie Check
+        if (share.expires_at && new Date() > new Date(share.expires_at)) {
+            release(); return res.status(410).json({ error: 'Share has Expired' });
+        }
+
+        // 5. Download Teller
+        const hasDownloaded = cookies[dlCookieName];
+        if (!hasDownloaded) {
+            const updateRes = await pool.query(
+                `UPDATE shares SET download_count = download_count + 1 
+                 WHERE id = $1 AND (max_downloads IS NULL OR download_count < max_downloads)
+                 RETURNING download_count, max_downloads`, [id]
+            );
+            if (updateRes.rows.length === 0) { release(); return res.status(410).end(); }
+            const row = updateRes.rows[0];
+            if (row.max_downloads != null && row.download_count >= row.max_downloads) {
+                await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
+            }
+            res.cookie(dlCookieName, '1', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' || config.secureCookies });
+        } else {
+            if (share.max_downloads && share.download_count >= share.max_downloads) {
+                // Optioneel: blokkeer als teller cookie er is maar max is bereikt
+            }
+        }
+
+        const files = (await pool.query('SELECT * FROM files WHERE share_id = $1', [id])).rows;
+        if (files.length === 0) { release(); return res.status(404).send('Empty'); }
+
+        const manifest = computeManifest(files);
+        const streamed = await tryStreamPrezip(
+            res,
+            pool,
+            SHARE_ZIPS_DIR,
+            'share',
+            id,
+            manifest,
+            `${id}.zip`
+        );
+        if (streamed) {
+            const totalSize = files.reduce((acc: number, f: any) => acc + parseInt(f.size), 0);
+            await logAudit(null, 'download_zip', 'share', id, req, { size: totalSize, prezip: true });
+            return;
+        }
+
+        const totalSize = files.reduce((acc: number, f: any) => acc + parseInt(f.size), 0);
+        const useCompression = totalSize < 100 * 1024 * 1024;
+
+        const archive = new ZipArchive({
+            zlib: { level: useCompression ? (config.zipLevel || 5) : 0 },
+            store: !useCompression
+        });
+
+        res.setHeader('Content-Type', 'application/zip');
+        res.attachment(`${id}.zip`);
+        archive.pipe(res);
+
+        const usedNames = new Set<string>();
+        files.forEach(f => {
+            const isMedia = config.zipNoMedia && (f.mime_type?.startsWith('image') || f.mime_type?.startsWith('video') || f.mime_type?.startsWith('audio'));
+            const shouldStore = !useCompression || isMedia;
+            let entryName = f.original_name;
+            if (usedNames.has(entryName)) {
+                let counter = 1;
+                const ext = path.extname(entryName);
+                const base = path.basename(entryName, ext);
+                while (usedNames.has(`${base} (${counter})${ext}`)) counter++;
+                entryName = `${base} (${counter})${ext}`;
+            }
+            usedNames.add(entryName);
+            archive.file(f.storage_path, { name: entryName, store: shouldStore } as Parameters<ZipArchive['file']>[1]);
+        });
+
+        await logAudit(null, 'download_zip', 'share', id, req, { size: totalSize });
+        await archive.finalize();
+
+    } catch (e: any) {
+        release();
+        console.error('Download error:', e);
+        if (!res.headersSent) res.status(500).send('Download failed');
+    }
+});
+
+apiRouter.delete('/shares/:id', authenticateToken, uploadLimiter, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const share = await pool.query('SELECT id FROM shares WHERE id = $1 AND user_id = $2', [authReq.params.id, authReq.user!.id]);
+
+    if (share.rows.length > 0) {
+        clearUploadSessionKeys(authReq.params.id);
+        await unlinkTempPartFilesForShare(authReq.params.id);
+        await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', authReq.params.id);
+        // EERST proberen bestanden te verwijderen
+        try {
+            await fs.rm(path.join(UPLOAD_DIR, authReq.params.id), { recursive: true, force: true });
+        } catch (e: any) {
+            console.error('⚠️ Couldn\'t delete files for', authReq.params.id, e.message);
+            // We gaan wel door met DB verwijderen, anders blijft de share 'hangen' in de UI
+        }
+
+        await logAudit(authReq.user!.id, 'share_deleted', 'share', authReq.params.id, req);
+        await pool.query('DELETE FROM shares WHERE id = $1', [authReq.params.id]);
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Not found' });
+    }
+});
+
+apiRouter.delete('/shares/:id/files/:fileId', authenticateToken, uploadLimiter, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const { id, fileId } = req.params;
+
+    // 1. Haal bestand info op
+    const file = await pool.query(
+        'SELECT f.storage_path FROM files f JOIN shares s ON f.share_id = s.id WHERE f.id = $1 AND s.user_id = $2 AND s.id = $3',
+        [fileId, authReq.user!.id, id]
+    );
+
+    if (file.rows.length > 0) {
+        // 2. Verwijder bestand uit DB en disk
+        await pool.query('DELETE FROM files WHERE id = $1', [fileId]);
+        if (file.rows[0].storage_path) await safeUnlink(file.rows[0].storage_path);
+
+        const remaining = await pool.query('SELECT COUNT(*) FROM files WHERE share_id = $1', [id]);
+        const count = parseInt(remaining.rows[0].count);
+
+        if (count === 0) {
+            // Share is leeg, ruim alles op (folder + share record)
+            try {
+                await fs.rm(path.join(UPLOAD_DIR, id), { recursive: true, force: true });
+            } catch (e) { }
+
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
+            await pool.query('DELETE FROM shares WHERE id = $1', [id]);
+            await logAudit(authReq.user!.id, 'share_deleted_empty', 'share', id, req, { reason: 'last_file_deleted' });
+
+            // Stuur terug dat share ook verwijderd is
+            return res.json({ success: true, shareDeleted: true });
+        }
+
+        res.json({ success: true, shareDeleted: false });
+    } else {
+        res.status(404).json({ error: 'Not found' });
+    }
+});
+
+apiRouter.delete('/shares/:id/folder', authenticateToken, uploadLimiter, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const { id } = req.params;
+    const folderPath = req.query.path as string;
+
+    if (!folderPath) {
+        return res.status(400).json({ error: 'Folder path is required' });
+    }
+
+    try {
+        // 1. Verify Ownership & Get Share
+        const shareRes = await pool.query('SELECT user_id FROM shares WHERE id = $1', [id]);
+        if (shareRes.rows.length === 0) return res.status(404).json({ error: 'Share not found' });
+        if (shareRes.rows[0].user_id !== authReq.user!.id) return res.status(403).json({ error: 'Access denied' });
+
+        // 2. Find all files that are inside this folder (prefix match on original_name)
+        // We look for files where original_name starts with "{folderPath}/"
+        const prefix = folderPath.endsWith('/') ? folderPath : `${folderPath}/`;
+
+        // Escape special characters in prefix for LIKE query if necessary, but standard parameterization handles most.
+        // However, standard SQL 'LIKE' needs % wildcards.
+        const fileRes = await pool.query(
+            'SELECT id, storage_path FROM files WHERE share_id = $1 AND original_name LIKE $2',
+            [id, `${prefix}%`]
+        );
+
+        if (fileRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Folder not found or empty' });
+        }
+
+        // 3. Delete files from DB & Disk
+        for (const file of fileRes.rows) {
+            await pool.query('DELETE FROM files WHERE id = $1', [file.id]);
+            if (file.storage_path) await safeUnlink(file.storage_path);
+        }
+
+        // 4. Try to remove the physical folder structure if it exists (best effort)
+        // The files are flattened in the share folder, but if we had a structure logic...
+        // Actually, in this app 'files' are stored flat with a random hash name in uploaddir/shareid/
+        // The 'folder' structure is virtual based on 'original_name'.
+        // So we only needed to delete the files that matched the virtual path.
+
+        // Check if share is empty
+        const remaining = await pool.query('SELECT COUNT(*) FROM files WHERE share_id = $1', [id]);
+        const count = parseInt(remaining.rows[0].count);
+
+        if (count === 0) {
+            try {
+                await fs.rm(path.join(UPLOAD_DIR, id), { recursive: true, force: true });
+            } catch (e) { }
+
+            await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
+            await pool.query('DELETE FROM shares WHERE id = $1', [id]);
+            await logAudit(authReq.user!.id, 'share_deleted_empty', 'share', id, req, { reason: 'folder_deleted_empty' });
+            return res.json({ success: true, shareDeleted: true });
+        }
+
+        await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
+        void triggerPrezip('share', id);
+        await logAudit(authReq.user!.id, 'folder_deleted', 'share', id, req, { folder: folderPath, fileCount: fileRes.rows.length });
+        res.json({ success: true, shareDeleted: false });
+
+    } catch (e: any) {
+        console.error('Delete folder error:', e);
+        res.status(500).json({ error: 'Failed to delete folder' });
+    }
+});
+
+// REVERSE
+apiRouter.post('/reverse', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    try {
+        const validated = reverseShareSchema.parse(authReq.body);
+        // Haal de nieuwe expiration velden op
+        const { name, maxSize, expirationVal, expirationUnit, password, notify, sendEmailTo, thankYouMessage, customSlug } = validated;
+
+        const config = await getConfig();
+        const maxAllowedBytes = getBytes(config.maxSizeVal || 10, config.maxSizeUnit || 'GB');
+        const cappedMaxSize = Math.min(maxSize, maxAllowedBytes);
+
+        // Default naam instellen als deze leeg is
+        const finalName = (name && name.trim() !== '') ? name : 'Reverse Share';
+
+        let id;
+        if (customSlug && customSlug.trim() !== '') {
+            id = customSlug.trim();
+            if (!isValidSlug(id)) return res.status(400).json({ error: 'Link may only contain letters, numbers and hyphens.' });
+
+            // Check of ID al bestaat in reverse_shares
+            const check = await pool.query('SELECT id FROM reverse_shares WHERE id = $1', [id]);
+            if (check.rows.length > 0) return res.status(409).json({ error: 'This Link is already in use.' });
+        } else {
+            id = await generateSecureId();
+        }
+
+        // Bereken expiresAt met de helper functie (net zoals bij normale shares)
+        let expiresAt = null;
+        if (expirationVal && expirationVal > 0) {
+            expiresAt = new Date(Date.now() + getTimeInMs(expirationVal, expirationUnit || 'Days'));
+        }
+
+        const passHash = password ? await Bun.password.hash(password) : null;
+
+        // Voeg thank_you_message toe aan insert
+        await pool.query(
+            `INSERT INTO reverse_shares (id, user_id, name, max_size, expires_at, password_hash, notify_email, thank_you_message) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [id, authReq.user!.id, finalName, cappedMaxSize, expiresAt, passHash, notify, thankYouMessage || null]
+        );
+        const baseUrl = getBaseUrl(config, req);
+        const link = `${baseUrl}/r/${id}`;
+        if (sendEmailTo) { await sendEmail(sendEmailTo, 'Upload Request', `<strong>${escapeHtml(authReq.user!.email)}</strong> invited you to upload files.`, link, 'Upload Files'); }
+        res.json({
+            success: true,
+            url: link,
+            name: finalName,
+            expiresAt: expiresAt ? expiresAt.toISOString() : null,
+            thankYouMessage: thankYouMessage || null,
+        });
+    } catch (e: any) {
+        if (e instanceof z.ZodError) {
+            return res.status(400).json({ error: e.issues[0].message });
+        }
+        console.error('Reverse Share creation failed:', e);
+        res.status(500).json({ error: e.message || 'Server error' });
+    }
+});
+
+apiRouter.get('/reverse', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const config = await getConfig();
+    const result = await pool.query(`SELECT r.*, (SELECT COUNT(*) FROM files f WHERE f.reverse_share_id = r.id) as file_count FROM reverse_shares r WHERE r.user_id = $1 ORDER BY created_at DESC`, [authReq.user!.id]);
+    res.json(result.rows.map(r => ({ ...r, url: `${config.appUrl || 'http://localhost:5173'}/r/${r.id}` })));
+});
+
+apiRouter.delete('/reverse/:id', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'reverse', authReq.params.id);
+    await pool.query('DELETE FROM reverse_shares WHERE id = $1 AND user_id = $2', [authReq.params.id, authReq.user!.id]);
+    res.json({ success: true });
+});
+
+apiRouter.get('/reverse/:id/files', authenticateToken, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const check = await pool.query('SELECT id FROM reverse_shares WHERE id = $1 AND user_id = $2', [authReq.params.id, authReq.user!.id]);
+    if (check.rows.length === 0) return res.status(403).json({ error: 'Access denied' });
+    const files = await pool.query('SELECT * FROM files WHERE reverse_share_id = $1 ORDER BY created_at DESC', [authReq.params.id]);
+    res.json(files.rows);
+});
+
+apiRouter.all('/reverse/files/:fileId/download', authenticateToken, downloadLimiter, async (req, res) => {
+    const authReq = req as AuthRequest;
+    const isHead = req.method === 'HEAD';
+    const wantInline =
+        (typeof req.query.inline === 'string' && req.query.inline === '1') ||
+        (typeof req.query.preview === 'string' && req.query.preview === '1');
+    const previewStreamPost =
+        req.method === 'POST' &&
+        String(req.headers['x-preview-stream'] || '').trim() === '1';
+    if (req.method === 'POST' && !previewStreamPost) {
+        return res.status(405).setHeader('Allow', 'GET, HEAD, OPTIONS, POST').send('POST requires X-Preview-Stream: 1');
+    }
+    const serveInline = wantInline || previewStreamPost;
+
+    // Check of de file bestaat EN of de huidige user eigenaar is van de reverse share
+    const result = await pool.query(
+        `SELECT f.storage_path, f.original_name 
+         FROM files f 
+         JOIN reverse_shares r ON f.reverse_share_id = r.id 
+         WHERE f.id = $1 AND r.user_id = $2`,
+        [req.params.fileId, authReq.user!.id]
+    );
+
+    if (result.rows.length === 0) {
+        return res.status(404).send('File not found or access denied.');
+    }
+
+    const file = result.rows[0];
+
+    // Force dangerous shortcut files to be zipped to prevent browser renaming (.download)
+    const ext = path.extname(file.original_name).toLowerCase();
+    if (ext === '.lnk' || ext === '.url') {
+        const archive = new ZipArchive({ zlib: { level: 9 } });
+        res.setHeader('Content-Type', 'application/zip');
+        res.attachment(`${file.original_name}.zip`);
+        archive.pipe(res);
+        archive.file(file.storage_path, { name: file.original_name });
+        await archive.finalize();
+        return;
+    }
+
+    // Security: Validate path is within UPLOAD_DIR
+    const resolvedPath = path.resolve(file.storage_path);
+    if (!resolvedPath.startsWith(path.resolve(UPLOAD_DIR))) {
+        return res.status(500).json({ error: 'File path security violation' });
+    }
+
+    // Handle HEAD request for PDF preview
+    if (isHead) {
+        const fs = require('fs');
+        res.setHeader('Content-Type', ext === '.pdf' ? 'application/pdf' : 'application/octet-stream');
+        res.setHeader('Content-Length', fs.statSync(resolvedPath).size);
+        res.setHeader('Accept-Ranges', 'bytes');
+        return res.status(200).end();
+    }
+
+    if (serveInline) {
+        const inlineMimes: Record<string, string> = {
+            '.pdf': 'application/pdf',
+            '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+            '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.mkv': 'video/x-matroska',
+            '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.aac': 'audio/aac'
+        };
+        const mime = inlineMimes[ext] || 'application/octet-stream';
+        res.setHeader('Content-Type', mime);
+        const base = path.basename(file.original_name);
+        res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(base)}`);
+        return res.sendFile(resolvedPath);
+    }
+
+    res.download(resolvedPath, file.original_name);
+});
+
+// 2. Download ALLES als ZIP uit Reverse Share (Authenticated)
+apiRouter.get('/reverse/:id/download', authenticateToken, downloadLimiter, async (req, res) => {
+    // Wacht op queue
+    try {
+        await zipQueue.wait();
+    } catch (e) {
+        return res.status(503).send('Server too busy.');
+    }
+
+    // Release handlers
+    res.on('finish', () => zipQueue.release());
+    res.on('close', () => zipQueue.release());
+    res.on('error', () => zipQueue.release());
+
+    try {
+        const authReq = req as AuthRequest;
+
+        // Check eigenaarschap
+        const shareCheck = await pool.query(
+            'SELECT id FROM reverse_shares WHERE id = $1 AND user_id = $2',
+            [req.params.id, authReq.user!.id]
+        );
+        if (shareCheck.rows.length === 0) return res.status(403).send('Access denied');
+
+        const files = await pool.query('SELECT * FROM files WHERE reverse_share_id = $1', [req.params.id]);
+        if (files.rows.length === 0) return res.status(404).send('No files');
+
+        const config = await getConfig();
+        const manifest = computeManifest(files.rows);
+        const streamed = await tryStreamPrezip(
+            res,
+            pool,
+            SHARE_ZIPS_DIR,
+            'reverse',
+            req.params.id,
+            manifest,
+            `reverse_share_${req.params.id}.zip`
+        );
+        if (streamed) {
+            await logAudit(authReq.user!.id, 'reverse_download_zip', 'reverse_share', req.params.id, req, {
+                prezip: true,
+            });
+            return;
+        }
+
+        const archive = new ZipArchive({ zlib: { level: config.zipLevel || 5 } });
+
+        res.attachment(`reverse_share_${req.params.id}.zip`);
+        archive.pipe(res);
+
+        for (const f of files.rows) {
+            archive.file(f.storage_path, { name: f.original_name });
+        }
+
+        // Audit log voor eigenaar download
+        await logAudit(authReq.user!.id, 'reverse_download_zip', 'reverse_share', req.params.id, req);
+
+        await archive.finalize();
+
+    } catch (e: any) {
+        zipQueue.release();
+        console.error('Reverse download error:', e);
+        if (!res.headersSent) res.status(500).send('Download failed');
+    }
+});
+
+const publicLimiter = createRateLimiter(60 * 1000, 100, "Too many requests");
+
+// PUBLIC
+apiRouter.get('/public/shares/:id', publicLimiter, async (req, res) => {
+    // 1. Haal ook max_downloads en download_count op
+    const share = await pool.query('SELECT name, password_hash, expires_at, message, max_downloads, download_count FROM shares WHERE id = $1', [req.params.id]);
+
+    if (share.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+
+    const s = share.rows[0];
+
+    // 2. Check Expiratie
+    if (s.expires_at && new Date() > new Date(s.expires_at)) return res.status(410).json({ error: 'Expired' });
+
+    // 3. Check Download Limiet (Dit zorgt dat de bestanden verborgen blijven)
+    if (s.max_downloads && s.download_count >= s.max_downloads) {
+        return res.status(410).json({ error: 'Download limit reached' });
+    }
+
+    const isProtected = !!s.password_hash;
+    const config = await getConfig();
+    const files = isProtected ? [] : (await pool.query('SELECT id, original_name, size, mime_type FROM files WHERE share_id = $1', [req.params.id])).rows;
+    res.json({ name: s.name, message: s.message, protected: isProtected, files, appName: config.appName });
+});
+
+apiRouter.post('/shares/:id/verify', loginLimiter, async (req, res) => {
+    const { id } = req.params;
+    const result = await pool.query('SELECT password_hash FROM shares WHERE id = $1', [id]);
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+
+    const passwordShare = req.body?.password;
+    if (typeof passwordShare !== 'string') return res.status(400).json({ error: 'Invalid password' });
+    const valid = await Bun.password.verify(passwordShare, result.rows[0].password_hash);
+
+    if (valid) {
+        // Maak een token aan dat bewijst dat dit IP/User het wachtwoord kent voor DEZE share
+        const accessPayload = { shareId: id, authorized: true };
+        const accessToken = jwt.sign(accessPayload, JWT_SECRET, { expiresIn: '1h' }); // 1 uur geldig
+
+        const config = await getConfig();
+        const isProduction = process.env.NODE_ENV === 'production';
+        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+        // Zet een HTTP-Only cookie die specifiek is voor deze share
+        res.cookie(`share_auth_${id}`, accessToken, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'lax', // Lax is nodig zodat de cookie wordt meegestuurd bij normale link-navigatie (downloaden)
+            maxAge: 3600000 // 1 uur
+        });
+
+        const files = (await pool.query('SELECT id, original_name, size, mime_type FROM files WHERE share_id = $1', [req.params.id])).rows;
+        res.json({ valid: true, files });
+    } else {
+        res.json({ valid: false });
+    }
+});
+
+/** Zelfde logica als /shares/:id/files/:fileId; POST /preview-file/:fileId heeft geen /files/ in het pad (IDM matcht vaak op …/files/…). */
+const shareFileHandler = async (req: any, res: any) => {
+    const { id, fileId } = req.params;
+    const isHead = req.method === 'HEAD';
+    /** Browser/preview fetch: geen attachment-dispositie (voorkomt IDM e.d. die de body leeg trekt). */
+    const wantInline =
+        (typeof req.query.inline === 'string' && req.query.inline === '1') ||
+        (typeof req.query.preview === 'string' && req.query.preview === '1');
+    /** POST + header of dedicated preview-route (zonder /files/). */
+    const previewStreamPost =
+        req.previewStreamPost === true ||
+        (req.method === 'POST' && String(req.headers['x-preview-stream'] || '').trim() === '1');
+    if (req.method === 'POST' && !previewStreamPost) {
+        return res.status(405).setHeader('Allow', 'GET, HEAD, OPTIONS, POST').send('POST requires X-Preview-Stream: 1');
+    }
+    const serveInline = wantInline || previewStreamPost;
+    const cookieName = `dl_${id}`;
+    const authCookieName = `share_auth_${id}`; // De beveiligingscookie
+    const cookies = parseCookies(req);
+    const hasDownloaded = cookies[cookieName];
+
+    // 0. Eerst share info ophalen om wachtwoord status te checken
+    const shareInfo = await pool.query('SELECT password_hash FROM shares WHERE id = $1', [id]);
+    if (shareInfo.rows.length === 0) return res.status(404).send('Share not found');
+
+    // BEVEILIGINGS CHECK: Als er een wachtwoord op zit, check het cookie
+    if (shareInfo.rows[0].password_hash) {
+        let authorized = false;
+
+        // 1. Check Owner Token (Authorization Header or 'token' cookie)
+        const authToken = cookies.token || req.headers['authorization']?.split(' ')[1];
+        if (authToken) {
+            try {
+                const user = jwt.verify(authToken, JWT_SECRET) as any;
+                // Check if this user owns the share
+                const ownerCheck = await pool.query('SELECT id FROM shares WHERE id = $1 AND user_id = $2', [id, user.id]);
+                if (ownerCheck.rows.length > 0) {
+                    authorized = true;
+                }
+            } catch (e) {
+                // Ignore invalid main token here, we fall back to share password
+            }
+        }
+
+        // 2. Check Share Password Cookie
+        if (!authorized) {
+            const authCookie = cookies[authCookieName];
+            if (!authCookie) return res.status(403).send('Access Denied: Password required.');
+
+            try {
+                const decoded: any = jwt.verify(authCookie, JWT_SECRET);
+                if (decoded.shareId !== id) throw new Error('Mismatch');
+                authorized = true;
+            } catch (e) {
+                return res.status(403).send('Access Denied: Session expired.');
+            }
+        }
+    }
+
+    // Stap 1: Metadata checken (nu we weten dat toegang mag)
+    const check = await pool.query(
+        'SELECT s.max_downloads, s.download_count, s.expires_at, f.storage_path, f.original_name FROM files f JOIN shares s ON f.share_id = s.id WHERE s.id = $1 AND f.id = $2',
+        [id, fileId]
+    );
+
+    if (check.rows.length === 0) return res.status(404).send('Not found');
+    const data = check.rows[0];
+
+    if (data.expires_at && new Date() > new Date(data.expires_at)) {
+        return res.status(410).send('Expired');
+    }
+
+    // Stap 2: Teller ophogen indien nodig (preview/inline/POST-stream telt niet als download)
+    if (!hasDownloaded && !serveInline) {
+        const updateRes = await pool.query(
+            `UPDATE shares 
+             SET download_count = download_count + 1 
+             WHERE id = $1 
+             AND (max_downloads IS NULL OR download_count < max_downloads)`,
+            [id]
+        );
+
+        if (updateRes.rowCount === 0) {
+            return res.status(410).end();
+        }
+
+        // Cookie zetten - Forceer secure in productie
+        res.cookie(cookieName, '1', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
+    }
+
+    // Stap 3: Bestand sturen (Force zip for shortcuts)
+    const ext = path.extname(data.original_name).toLowerCase();
+    if (ext === '.lnk' || ext === '.url') {
+        const archive = new ZipArchive({ zlib: { level: 9 } });
+        res.setHeader('Content-Type', 'application/zip');
+        res.attachment(`${data.original_name}.zip`);
+        archive.pipe(res);
+        archive.file(data.storage_path, { name: data.original_name });
+        await archive.finalize();
+        return;
+    }
+
+    // Security: Validate path is within UPLOAD_DIR
+    const resolvedPath = path.resolve(data.storage_path);
+    if (!resolvedPath.startsWith(path.resolve(UPLOAD_DIR))) {
+        return res.status(500).send('File path security violation');
+    }
+
+    // Handle HEAD request for PDF/video preview - detect content type
+    if (isHead) {
+        const fs = require('fs');
+        const stat = fs.statSync(resolvedPath);
+        const ext = path.extname(data.original_name).toLowerCase();
+        
+        // Map extensions to MIME types
+        const mimeTypes: Record<string, string> = {
+            '.pdf': 'application/pdf',
+            '.mp4': 'video/mp4',
+            '.webm': 'video/webm',
+            '.ogg': 'video/ogg',
+            '.mov': 'video/quicktime',
+            '.avi': 'video/x-msvideo',
+            '.mkv': 'video/x-matroska',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+        };
+        
+        res.setHeader('Content-Type', mimeTypes[ext] || 'application/octet-stream');
+        res.setHeader('Content-Length', stat.size);
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('X-Download-Options', 'noopen');
+        return res.status(200).end();
+    }
+
+    // Handle Range requests for video streaming
+    if (req.headers.range) {
+        const fs = require('fs');
+        const stat = fs.statSync(resolvedPath);
+        const parts = req.headers.range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+        const chunksize = end - start + 1;
+        
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Length', chunksize);
+        
+        const ext = path.extname(data.original_name).toLowerCase();
+        const videoMimes: Record<string, string> = {
+            '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg',
+            '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.mkv': 'video/x-matroska'
+        };
+        res.setHeader('Content-Type', videoMimes[ext] || 'video/mp4');
+        res.status(206);
+        
+        const stream = fs.createReadStream(resolvedPath, { start, end });
+        stream.pipe(res);
+        return;
+    }
+
+    // Inline weergave in browser (preview): geen attachment — anders pakken download-managers de stream af
+    if (serveInline) {
+        const inlineMimes: Record<string, string> = {
+            '.pdf': 'application/pdf',
+            '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+            '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.mkv': 'video/x-matroska',
+            '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.aac': 'audio/aac'
+        };
+        /**
+         * POST /ui/payload: response als JSON + base64 i.p.v. ruwe bytes — download-managers koppelen vaak nog aan
+         * dezelfde URL; zo is er geen PDF/octet-stream body om te onderscheppen.
+         */
+        if (req.uiPayload === true) {
+            const mime = inlineMimes[ext] || 'application/octet-stream';
+            const buf = await fs.readFile(resolvedPath);
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            return res.json({ t: mime, d: buf.toString('base64') });
+        }
+        const mime = inlineMimes[ext] || 'application/octet-stream';
+        res.setHeader('Content-Type', mime);
+        const base = path.basename(data.original_name);
+        res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(base)}`);
+        return res.sendFile(resolvedPath);
+    }
+
+    res.download(resolvedPath, data.original_name);
+};
+
+/**
+ * SPA inline blob: POST JSON { a: shareId, b: fileId } — pad bevat geen shares/files/preview (download-managers matchen vaak op URL).
+ */
+apiRouter.post('/ui/payload', downloadLimiter, async (req: any, res: any) => {
+    const a = req.body?.a;
+    const b = req.body?.b;
+    if (a == null || a === '' || b == null || b === '') {
+        return res.status(400).json({ error: 'Invalid payload' });
+    }
+    req.params = { id: String(a), fileId: String(b) };
+    req.previewStreamPost = true;
+    req.uiPayload = true;
+    return shareFileHandler(req, res);
+});
+
+/** Staged temp-bestand (My Shares → edit): zelfde JSON+base64 als /ui/payload; GET /preview-stage bestaat alleen voor raw download. */
+apiRouter.post('/ui/staged', authenticateToken, downloadLimiter, async (req: any, res: any) => {
+    const tempIdRaw = req.body?.c;
+    if (tempIdRaw == null || tempIdRaw === '') {
+        return res.status(400).json({ error: 'Invalid payload' });
+    }
+    const tempId = String(tempIdRaw);
+    const tempIdRegex = /^staged_[a-f0-9]{32}(\.[a-zA-Z0-9]+)?$/;
+    if (!tempIdRegex.test(tempId)) {
+        return res.status(403).json({ error: 'Invalid file' });
+    }
+    const filePath = path.join(TEMP_DIR, tempId);
+    if (!path.resolve(filePath).startsWith(path.resolve(TEMP_DIR))) {
+        return res.status(403).json({ error: 'Invalid path' });
+    }
+    try {
+        await fs.access(filePath);
+    } catch {
+        return res.status(404).json({ error: 'Not found' });
+    }
+    const ext = path.extname(tempId).toLowerCase();
+    const dangerousTypes = ['.html', '.htm', '.xhtml', '.svg', '.xml', '.php'];
+    if (dangerousTypes.includes(ext)) {
+        return res.status(403).json({ error: 'Preview not allowed' });
+    }
+    const inlineMimes: Record<string, string> = {
+        '.pdf': 'application/pdf',
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+        '.mp4': 'video/mp4', '.webm': 'video/webm'
+    };
+    const mime = inlineMimes[ext] || 'application/octet-stream';
+    const buf = await fs.readFile(filePath);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.json({ t: mime, d: buf.toString('base64') });
+});
+
+/** Reverse-share bestand (eigenaar): JSON+base64 i.p.v. GET …/reverse/files/:id/download (pdf.js / IDM). */
+apiRouter.post('/ui/reverse-file', authenticateToken, downloadLimiter, async (req: any, res: any) => {
+    const authReq = req as AuthRequest;
+    const fileIdRaw = req.body?.e;
+    if (fileIdRaw == null || fileIdRaw === '') {
+        return res.status(400).json({ error: 'Invalid payload' });
+    }
+    const result = await pool.query(
+        `SELECT f.storage_path, f.original_name 
+         FROM files f 
+         JOIN reverse_shares r ON f.reverse_share_id = r.id 
+         WHERE f.id = $1 AND r.user_id = $2`,
+        [fileIdRaw, authReq.user!.id]
+    );
+    if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Not found' });
+    }
+    const row = result.rows[0];
+    const ext = path.extname(row.original_name).toLowerCase();
+    if (ext === '.lnk' || ext === '.url') {
+        return res.status(400).json({ error: 'Preview not available for this type' });
+    }
+    const resolvedPath = path.resolve(row.storage_path);
+    if (!resolvedPath.startsWith(path.resolve(UPLOAD_DIR))) {
+        return res.status(500).json({ error: 'Invalid path' });
+    }
+    const dangerousTypes = ['.html', '.htm', '.xhtml', '.svg', '.xml', '.php'];
+    if (dangerousTypes.includes(ext)) {
+        return res.status(403).json({ error: 'Preview not allowed' });
+    }
+    const inlineMimes: Record<string, string> = {
+        '.pdf': 'application/pdf',
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+        '.mp4': 'video/mp4', '.webm': 'video/webm'
+    };
+    const mime = inlineMimes[ext] || 'application/octet-stream';
+    const buf = await fs.readFile(resolvedPath);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.json({ t: mime, d: buf.toString('base64') });
+});
+
+apiRouter.post(
+    '/shares/:id/preview-file/:fileId',
+    downloadLimiter,
+    (req: any, _res: any, next: any) => {
+        req.previewStreamPost = true;
+        next();
+    },
+    shareFileHandler
+);
+
+apiRouter.all('/shares/:id/files/:fileId', downloadLimiter, shareFileHandler);
+
+// GUEST UPLOAD
+apiRouter.get('/public/reverse/:id', async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid link ID format' });
+    // Selecteer ook thank_you_message
+    const result = await pool.query('SELECT name, max_size, expires_at, password_hash, thank_you_message FROM reverse_shares WHERE id = $1', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const share = result.rows[0];
+    if (share.expires_at && new Date() > new Date(share.expires_at)) return res.status(410).json({ error: 'Expired' });
+
+    const config = await getConfig();
+    res.json({
+        name: share.name,
+        maxSize: share.max_size,
+        protected: !!share.password_hash,
+        thankYouMessage: share.thank_you_message,
+        appName: config.appName
+    });
+});
+
+apiRouter.post('/public/reverse/:id/verify', loginLimiter, async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid link ID format' });
+    const result = await pool.query('SELECT password_hash FROM reverse_shares WHERE id = $1', [id]);
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+
+    const passwordRev = req.body?.password;
+    if (typeof passwordRev !== 'string') return res.status(400).json({ error: 'Invalid password' });
+    const valid = await Bun.password.verify(passwordRev, result.rows[0].password_hash);
+
+    if (valid) {
+        // --- BEVEILIGING START ---
+        const token = jwt.sign({ shareId: id, scope: 'upload' }, JWT_SECRET, { expiresIn: '1h' });
+        const config = await getConfig();
+        const isProduction = process.env.NODE_ENV === 'production';
+        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+
+        res.cookie(`rev_auth_${id}`, token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'strict',
+            maxAge: 3600000
+        });
+        // --- BEVEILIGING EIND ---
+
+        res.json({ valid: true });
+    } else {
+        res.json({ valid: false });
+    }
+});
+
+// REVERSE SHARE CHUNKED UPLOAD (GUEST)
+
+// STAP 1: Init Guest Upload (JSON only — no file body; size limits apply on /chunk)
+apiRouter.post('/public/reverse/:id/init', uploadLimiter, async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid link ID format' });
+    const shareRes = await pool.query('SELECT * FROM reverse_shares WHERE id = $1', [id]);
+    if (shareRes.rows.length === 0) return res.status(404).json({ error: 'Link not found' });
+
+    const share = shareRes.rows[0];
+    if (share.expires_at && new Date() > new Date(share.expires_at)) {
+        return res.status(410).json({ error: 'Link has expired' });
+    }
+
+    if (share.password_hash) {
+        const cookies = parseCookies(req);
+        const token = cookies[`rev_auth_${id}`];
+        if (!token) return res.status(403).json({ error: 'Password required' });
+
+        try {
+            const decoded: any = jwt.verify(token, JWT_SECRET);
+            if (decoded.shareId !== id) throw new Error();
+        } catch { return res.status(403).json({ error: 'Session invalid' }); }
+    }
+
+    const rawFileNames = (req.body as { fileNames?: unknown })?.fileNames;
+    if (rawFileNames !== undefined && rawFileNames !== null) {
+        if (!Array.isArray(rawFileNames)) {
+            return res.status(400).json({ error: 'fileNames must be an array of strings' });
+        }
+        try {
+            const config = await getConfig();
+            assertUploadFileNamesAllowed(
+                rawFileNames.map((n) => String(n)),
+                config,
+                'guest'
+            );
+        } catch (e: any) {
+            return res.status(400).json({ error: e.message || 'File type not allowed' });
+        }
+    }
+
+    res.json({ success: true, reverseShareId: id });
+});
+
+// STAP 2: Chunk Guest Upload
+apiRouter.post('/public/reverse/:id/chunk', checkUploadLimits, uploadLimiter, chunkUploadPublic.single('chunk'), async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid reverse share ID format' });
+    const { fileName, chunkIndex, fileId, chunkHash } = req.body;
+    if (!isValidId(fileId)) return res.status(400).json({ error: 'Invalid File ID format' });
+
+    if (!req.file) return res.status(400).json({ error: 'No data' });
+
+    if (!isPathUnderDir(TEMP_DIR, req.file.path)) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid upload path' });
+    }
+
+    // UNIEKE NAAM: Opslaan als .part bestand (één bestand dat groeit)
+    const safeFileName = safeUploadBaseName(fileName);
+    if (!safeFileName) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid file name' });
+    }
+    if (await rejectBlockedUploadFilename(fileName, 'guest', res, req.file.path)) return;
+
+    const partFilePath = path.join(TEMP_DIR, `rev_${id}_${fileId}_${safeFileName}.part`);
+    if (!isResolvedPathInsideDir(TEMP_DIR, partFilePath)) {
+        await safeUnlink(req.file.path);
+        return res.status(400).json({ error: 'Invalid path' });
+    }
+
+    try {
+        // 2. Database checks (Quota & Validiteit & PASSWORD)
+        // Let op: 'r.password_hash' toegevoegd aan SELECT
+        const shareCheck = await pool.query(
+            `SELECT r.max_size, r.password_hash, COALESCE(SUM(f.size), 0) as current_used 
+             FROM reverse_shares r 
+             LEFT JOIN files f ON r.id = f.reverse_share_id 
+             WHERE r.id = $1 
+             GROUP BY r.id`,
+            [id]
+        );
+
+        if (shareCheck.rows.length === 0) {
+            await safeUnlink(req.file.path);
+            return res.status(404).json({ error: 'Link not found' });
+        }
+
+        const share = shareCheck.rows[0];
+
+        if (share.password_hash) {
+            const cookies = parseCookies(req);
+            const token = cookies[`rev_auth_${id}`];
+            if (!token) {
+                await safeUnlink(req.file.path);
+                return res.status(403).json({ error: 'Password required' });
+            }
+            try {
+                const decoded: any = jwt.verify(token, JWT_SECRET);
+                if (decoded.shareId !== id) throw new Error();
+            } catch {
+                await safeUnlink(req.file.path);
+                return res.status(403).json({ error: 'Session invalid' });
+            }
+        }
+
+        const { max_size, current_used } = share;
+        const maxSize = parseInt(max_size);
+        const currentDbUsage = parseInt(current_used);
+
+        const chunkData = await fs.readFile(req.file.path);
+
+        const chunkHashStrGuest = typeof chunkHash === 'string' ? chunkHash : '';
+        if (chunkHashStrGuest) {
+            if (!/^[a-fA-F0-9]{64}$/.test(chunkHashStrGuest)) {
+                await safeUnlink(req.file.path);
+                return res.status(400).json({ error: 'Invalid chunk hash format' });
+            }
+
+            const cryptoMod = await import('crypto');
+            const hash = cryptoMod.createHash('sha256').update(chunkData).digest('hex');
+
+            if (hash !== chunkHashStrGuest.toLowerCase()) {
+                await safeUnlink(req.file.path);
+                return res.status(400).json({ error: 'Chunk hash mismatch - data corruption detected' });
+            }
+        }
+
+        // Get expected chunk size from header or use default (20MB)
+        const sizeMap: any = { 'KB': 1024, 'MB': 1024 * 1024, 'GB': 1024 * 1024 * 1024, 'TB': 1024 * 1024 * 1024 * 1024 };
+        const defaultChunkSize = 20 * 1024 * 1024; // 20MB default
+        const chunkSize = parseInt(req.headers['x-chunk-size'] as string) || defaultChunkSize;
+
+        const chunkIdx = parseInt(String(chunkIndex), 10);
+        if (!Number.isFinite(chunkIdx) || chunkIdx < 0) {
+            await safeUnlink(req.file.path);
+            return res.status(400).json({ error: 'Invalid chunk index' });
+        }
+
+        /** Zelfde als /shares/:id/chunk: zonder bestaand .part mag chunk > 0 niet (parallel batches retryen tot chunk 0 klaar is). */
+        if (chunkIdx > 0) {
+            try {
+                await fs.access(partFilePath);
+            } catch {
+                await safeUnlink(req.file.path);
+                return res.status(400).json({ error: 'Upload chunk 0 before later chunks for each file.' });
+            }
+        }
+
+        // Bij chunk 0: quota + schone start (na eventuele gefaalde eerdere upload)
+        if (chunkIdx === 0) {
+            if (maxSize > 0 && currentDbUsage >= maxSize) {
+                await safeUnlink(req.file.path);
+                return res.status(413).json({ error: `Share limit exceeded.` });
+            }
+            await safeUnlink(partFilePath);
+        }
+
+        const offset = chunkIdx * chunkSize;
+        
+        try {
+            const { createWriteStream } = await import('fs');
+            await new Promise<void>((resolve, reject) => {
+                const stream = createWriteStream(partFilePath, { 
+                    flags: 'r+',
+                    start: offset 
+                });
+                stream.on('error', reject);
+                stream.on('finish', resolve);
+                stream.end(chunkData);
+            });
+        } catch {
+            const { createWriteStream } = await import('fs');
+            await new Promise<void>((resolve, reject) => {
+                const stream = createWriteStream(partFilePath, { 
+                    flags: 'w',
+                    start: offset 
+                });
+                stream.on('error', reject);
+                stream.on('finish', resolve);
+                stream.end(chunkData);
+            });
+        }
+
+        await safeUnlink(req.file.path);
+
+        res.json({ success: true, chunkIndex: chunkIdx });
+    } catch (e: any) {
+        if (req.file) await safeUnlink(req.file.path);
+        console.error('Guest Chunk error:', e);
+        res.status(500).json({ error: 'Chunk write failed' });
+    }
+});
+
+// STAP 3: Finalize Guest Upload
+// ROBUUSTE GAST UPLOAD - FINALIZE
+apiRouter.post('/public/reverse/:id/finalize', uploadLimiter, async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(400).json({ error: 'Invalid Share ID format' });
+
+    const { files, password } = req.body;
+    if (!Array.isArray(files)) return res.status(400).json({ error: 'Invalid files data' });
+    for (const f of files) {
+        if (!isValidId(f.fileId)) return res.status(400).json({ error: 'Invalid File ID format' });
+    }
+
+
+    const client = await pool.connect();
+
+    try {
+        const config = await getConfig();
+        const totalUploadSize = files.reduce((acc: number, f: any) => acc + f.size, 0);
+
+        // 1. Check share en limieten
+        const shareRes = await client.query(`
+            SELECT r.*, COALESCE(SUM(f.size), 0) as current_used 
+            FROM reverse_shares r 
+            LEFT JOIN files f ON r.id = f.reverse_share_id 
+            WHERE r.id = $1 
+            GROUP BY r.id`, [id]);
+
+        if (shareRes.rows.length === 0) throw new Error('Invalid share');
+        const share = shareRes.rows[0];
+
+        if (share.password_hash) {
+            const cookies = parseCookies(req);
+            const token = cookies[`rev_auth_${id}`];
+            if (!token) throw new Error('Password required'); // Gooit error die door catch wordt gevangen
+
+            try {
+                const decoded: any = jwt.verify(token, JWT_SECRET);
+                if (decoded.shareId !== id) throw new Error();
+            } catch { throw new Error('Session invalid'); }
+        }
+
+        if (share.max_size > 0 && (parseInt(share.current_used) + totalUploadSize > parseInt(share.max_size))) {
+            throw new Error(`Upload exceeds the limit of ${formatBytes(share.max_size)}.`);
+        }
+
+        try {
+            assertUploadFileNamesAllowed(
+                files.map((f: { fileName?: string; originalName?: string }) => f.fileName || f.originalName || ''),
+                config,
+                'guest'
+            );
+        } catch (extErr: any) {
+            await unlinkTempPartFilesForReverseShare(id);
+            return res.status(400).json({ error: extErr.message || 'File type not allowed' });
+        }
+
+        await client.query('BEGIN');
+
+        // 3. Verwerken van bestanden
+        for (const f of files) {
+            // Bereken chunks
+            const k = 1024;
+            const sizeMap: any = { 'KB': k, 'MB': k * k, 'GB': k * k * k, 'TB': k * k * k * k };
+            const chunkSizeVal = config.chunkSizeVal || 20;
+            const chunkSizeUnit = config.chunkSizeUnit || 'MB';
+            const CHUNK_SIZE = chunkSizeVal * (sizeMap[chunkSizeUnit] || sizeMap['MB']);
+            const totalChunks = Math.ceil(f.size / CHUNK_SIZE);
+
+            // Bepaal paden
+            const safeOriginalName = sanitizeFilename(f.originalName);
+            const uniqueName = crypto.randomBytes(8).toString('hex') + path.extname(f.fileName);
+            const GUEST_DIR = path.join(UPLOAD_DIR, 'guest_uploads');
+            await fs.mkdir(GUEST_DIR, { recursive: true });
+            const finalPath = path.join(GUEST_DIR, uniqueName);
+
+            // Voeg samen (Rename .part file)
+            const safeChunkName = safeUploadBaseName(f.fileName);
+            if (!safeChunkName) throw new Error(`Invalid file name for ${f.originalName || 'upload'}`);
+            // Prefix for guest: rev_id_fileId_safeChunkName
+            const partPath = path.join(TEMP_DIR, `rev_${id}_${f.fileId}_${safeChunkName}.part`);
+            if (!isResolvedPathInsideDir(TEMP_DIR, partPath) || !isResolvedPathInsideDir(path.resolve(UPLOAD_DIR, 'guest_uploads'), finalPath)) {
+                throw new Error('Security error: invalid storage path');
+            }
+
+            try {
+                await fs.rename(partPath, finalPath);
+            } catch (e) {
+                throw new Error(`Upload failed processing ${f.originalName} (Part Missing)`);
+            }
+
+            await scanPathWithClamav({
+                filePath: finalPath,
+                displayName: f.originalName,
+                fileSizeBytes: f.size,
+                config,
+                demoMode: DEMO_MODE,
+                scanContext: 'reverse',
+                clamscanInstance,
+                unlink: safeUnlink,
+                messages: SCAN_MESSAGES_REVERSE,
+                scanTimeoutMs: CLAMAV_TIMEOUT_MS,
+            });
+
+            const dangerousTypes = ['.exe', '.bat', '.cmd', '.sh', '.php', '.pl', '.py', '.cgi', '.jar', '.msi', '.com', '.scr', '.hta'];
+            if (dangerousTypes.includes(path.extname(safeOriginalName).toLowerCase())) {
+                await safeUnlink(finalPath);
+                throw new Error(`Security violation: File type not allowed.`);
+            }
+
+            // Database insert
+            await client.query(
+                `INSERT INTO files (reverse_share_id, filename, original_name, size, mime_type, storage_path) VALUES ($1, $2, $3, $4, $5, $6)`,
+                [id, uniqueName, safeOriginalName, f.size, f.mimeType, finalPath]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        void invalidatePrezip(pool, SHARE_ZIPS_DIR, 'reverse', id).then(() => triggerPrezip('reverse', id));
+
+        // Notificatie Email
+        if (share.notify_email) {
+            try {
+                const creator = await pool.query('SELECT email FROM users WHERE id = $1', [share.user_id]);
+                if (creator.rows.length > 0) {
+                    const baseUrl = getBaseUrl(config, req);
+                    await sendEmail(creator.rows[0].email, `New Upload in "${share.name}"`,
+                        `<p>There are ${files.length} new files uploaded via your public link.</p>`,
+                        `${baseUrl}/reverse`, 'View Dashboard');
+                }
+            } catch (mailErr) { }
+        }
+
+        res.json({ success: true });
+
+    } catch (e: any) {
+        await client.query('ROLLBACK');
+        console.error("Finalize error:", e);
+        const status = e.message.includes('Virus') ? 400 : 500;
+        res.status(status).json({ error: e.message || 'Fail' });
+    } finally {
+        client.release();
+    }
+});
+
+// --- CLI ---
+async function runCLI() {
+    const args = process.argv.slice(2);
+    if (args.length === 0) return;
+    const command = args[0]; const params = args.slice(1);
+    console.log('--- Nexo Share CLI v2.0 ---');
+
+    try {
+        if (command === 'help') {
+            console.log('\nUser Management:');
+            console.log('  list-users                               - Show all users');
+            console.log('  create-user <email> <name> <pass> <adm?> - Create new user (adm?=true/false)');
+            console.log('  set-admin <email> <true/false>           - Promote or demote user');
+            console.log('  reset-password <email> <newpass>         - Force reset password');
+            console.log('  delete-user <email>                      - Delete user and their data');
+            console.log('  2fa-disable <email>                      - Emergency disable 2FA for user');
+
+            console.log('\nConfiguration (General):');
+            console.log('  config-list                              - Show all current settings');
+            console.log('  config-get <key>                         - Show single value');
+            console.log('  config-set <key> <value>                 - Set value (auto-detects bool/number)');
+            console.log('  config-unset <key>                       - Remove key (reset to default)');
+            console.log('  setup-reset                              - Set setup_completed=false (Force Wizard)');
+
+            console.log('\nConfiguration (Bulk Helpers):');
+            console.log('  config-smtp <host> <port> <user> <pass> <from> <secure?> - Set all SMTP settings');
+            console.log('  config-sso <issuer> <client_id> <secret>                 - Set OIDC settings');
+            console.log('  config-sso-admin-groups <g1> [g2...]                     - SSO groups that grant admin (empty = skip policy)');
+            console.log('  security-toggle <feature> <true/false>                   - Features: 2fa, passkeys, reset');
+
+            console.log('\nSystem:');
+            console.log('  cleanup                                  - Run manual garbage collection');
+            console.log('  system-info                              - Show server environment info');
+        }
+
+        // --- USER COMMANDS ---
+        else if (command === 'list-users') { const r = await pool.query('SELECT id, email, name, is_admin, totp_enabled FROM users'); console.table(r.rows); }
+        else if (command === 'create-user') {
+            if (params.length < 4) { console.log('Usage: create-user <email> <name> <pass> <is_admin>'); return; }
+            await pool.query('INSERT INTO users (email, name, password_hash, is_admin) VALUES ($1, $2, $3, $4)', [params[0], params[1], await Bun.password.hash(params[2]), params[3] === 'true']);
+            console.log(`User ${params[0]} created.`);
+        }
+        else if (command === 'set-admin') { await pool.query('UPDATE users SET is_admin=$1 WHERE email=$2', [params[1] === 'true', params[0]]); console.log(`Admin status for ${params[0]} set to ${params[1]}`); }
+        else if (command === 'reset-password') { await pool.query('UPDATE users SET password_hash=$1 WHERE email=$2', [await Bun.password.hash(params[1]), params[0]]); console.log(`Password reset for ${params[0]}`); }
+        else if (command === 'delete-user') { await pool.query('DELETE FROM users WHERE email=$1', [params[0]]); console.log(`User ${params[0]} deleted.`); }
+        else if (command === '2fa-disable') {
+            const r = await pool.query('SELECT id FROM users WHERE email=$1', [params[0]]);
+            if (r.rows.length === 0) console.log('User not found');
+            else { await pool.query('UPDATE users SET totp_secret=NULL,totp_enabled=FALSE,backup_codes=NULL WHERE id=$1', [r.rows[0].id]); console.log(`2FA disabled for ${params[0]}`); }
+        }
+
+        // --- CONFIG COMMANDS ---
+        else if (command === 'config-list') {
+            const r = await pool.query('SELECT data, setup_completed FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+            // Mask secrets
+            if (c.smtpPass) c.smtpPass = '********';
+            if (c.oidcSecret) c.oidcSecret = '********';
+            console.log('Setup Completed:', r.rows[0]?.setup_completed);
+            console.table(Object.entries(c).map(([k, v]) => ({ Key: k, Value: String(v).substring(0, 50) })));
+        }
+        else if (command === 'config-get') {
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            console.log(r.rows[0]?.data?.[params[0]] ?? 'Not set');
+        }
+        else if (command === 'config-set') {
+            if (params.length < 2) { console.log('Usage: config-set <key> <value>'); return; }
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+            let v: any = params[1];
+
+            // Smart Type Detection
+            if (v === 'true') v = true;
+            else if (v === 'false') v = false;
+            // Alleen naar nummer converteren als het geen wachtwoord/secret/host is
+            else if (params[0] === 'ssoAdminGroups' && params[1].startsWith('[')) {
+                try {
+                    v = JSON.parse(params[1]);
+                } catch {
+                    console.log('Invalid JSON for ssoAdminGroups');
+                    return;
+                }
+            }
+            else if (params[0] === 'ssoAdminGroups') {
+                v = params.slice(1).join(' ').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+            }
+            else if (!isNaN(Number(v)) && !['smtpPass', 'oidcSecret', 'smtpUser', 'smtpHost', 'appName'].includes(params[0])) {
+                v = Number(v);
+            }
+
+            c[params[0]] = v;
+            await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
+            console.log(`Set ${params[0]} = ${v} [Type: ${typeof v}]`);
+        }
+        else if (command === 'config-unset') {
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+            if (c[params[0]] !== undefined) {
+                delete c[params[0]];
+                await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
+                console.log(`Key '${params[0]}' removed (reset to default).`);
+            } else {
+                console.log('Key not found.');
+            }
+        }
+        else if (command === 'setup-reset') {
+            await pool.query('UPDATE config SET setup_completed = FALSE WHERE id=1');
+            console.log('✅ Setup wizard re-enabled. Reload the page to see the wizard.');
+        }
+
+        // --- BULK HELPERS ---
+        else if (command === 'config-smtp') {
+            if (params.length < 5) { console.log('Usage: config-smtp <host> <port> <user> <pass> <from> [secure=true]'); return; }
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+            c.smtpHost = params[0];
+            c.smtpPort = parseInt(params[1]);
+            c.smtpUser = params[2];
+            c.smtpPass = params[3];
+            c.smtpFrom = params[4];
+            c.smtpSecure = params[5] === 'true';
+            await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
+            console.log('✅ SMTP configuration updated.');
+        }
+        else if (command === 'config-sso') {
+            if (params.length < 3) { console.log('Usage: config-sso <issuer_url> <client_id> <client_secret>'); return; }
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+            c.ssoEnabled = true;
+            c.oidcIssuer = params[0];
+            c.oidcClientId = params[1];
+            c.oidcSecret = params[2];
+            await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
+            console.log('✅ SSO configuration updated & enabled.');
+        }
+        else if (command === 'config-sso-admin-groups') {
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+            c.ssoAdminGroups = params.filter(Boolean);
+            await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
+            console.log('✅ SSO admin groups:', c.ssoAdminGroups);
+        }
+        else if (command === 'security-toggle') {
+            const feature = params[0];
+            const enabled = params[1] === 'true';
+            const r = await pool.query('SELECT data FROM config WHERE id=1');
+            const c = r.rows[0]?.data || {};
+
+            if (feature === '2fa') c.require2FA = enabled;
+            else if (feature === 'passkeys') c.allowPasskeys = enabled;
+            else if (feature === 'reset') c.allowPasswordReset = enabled;
+            else { console.log('Unknown feature. Use: 2fa, passkeys, or reset'); return; }
+
+            await pool.query('UPDATE config SET data=$1 WHERE id=1', [c]);
+            console.log(`Security feature '${feature}' set to ${enabled}`);
+        }
+
+        // --- SYSTEM ---
+        else if (command === 'cleanup') {
+            console.log('🧹 Starting manual cleanup...');
+            await cleanupOrphanedFolders();
+            await cleanupOrphanedGuestFiles();
+            await cleanupOrphanedShareFiles();
+            console.log('✅ Manual cleanup finished.');
+        }
+        else if (command === 'system-info') {
+            const config = await getConfig();
+            console.log('\n--- System Info ---');
+            console.log(`App Name:      ${config.appName}`);
+            console.log(`App URL:       ${config.appUrl}`);
+            console.log(`Environment:   ${process.env.NODE_ENV || 'development'}`);
+            console.log(`Upload Dir:    ${UPLOAD_DIR}`);
+            console.log(`SMTP Status:   ${config.smtpHost ? 'Configured' : 'Not configured'}`);
+            console.log(`Timezone:      ${process.env.TZ || 'UTC'}`);
+            console.log(`DB Host:       ${process.env.DB_HOST}:${process.env.DB_PORT}`);
+        }
+        else console.log('Unknown command. Type "help" for a list of commands.');
+
+    } catch (e: any) {
+        console.error('CLI Error:', e.message);
+    } finally {
+        await pool.end();
+        process.exit(0);
+    }
+}
+
+async function initDB() {
+    let retries = 5;
+    while (retries > 0) {
+        try {
+            // STAP 1: Database Connectie
+            const client = await pool.connect();
+            try {
+                // 1a. Basis Tabellen (Create if not exists)
+                await client.query(`
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY, 
+                        email VARCHAR(255) UNIQUE, 
+                        password_hash VARCHAR(255), 
+                        name VARCHAR(255), 
+                        is_admin BOOLEAN DEFAULT FALSE, 
+                        totp_secret TEXT,
+                        totp_enabled BOOLEAN DEFAULT FALSE,
+                        backup_codes TEXT,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                    CREATE TABLE IF NOT EXISTS shares (id VARCHAR(32) PRIMARY KEY, user_id INTEGER, name VARCHAR(255), password_hash VARCHAR(255), expires_at TIMESTAMP, recipients TEXT, message TEXT, max_downloads INTEGER, download_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT NOW());
+                    CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY, data JSONB);
+                    CREATE TABLE IF NOT EXISTS reverse_shares (id VARCHAR(32) PRIMARY KEY, user_id INTEGER, name VARCHAR(255), max_size BIGINT, expires_at TIMESTAMP, password_hash VARCHAR(255), notify_email BOOLEAN, created_at TIMESTAMP DEFAULT NOW());
+                    CREATE TABLE IF NOT EXISTS contacts (id SERIAL PRIMARY KEY, user_id INTEGER, email VARCHAR(255), created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, email));
+                    CREATE TABLE IF NOT EXISTS files (
+                        id SERIAL PRIMARY KEY, share_id VARCHAR(32) REFERENCES shares(id) ON DELETE CASCADE ON UPDATE CASCADE, 
+                        reverse_share_id VARCHAR(32) REFERENCES reverse_shares(id) ON DELETE CASCADE ON UPDATE CASCADE, 
+                        filename VARCHAR(255), original_name VARCHAR(255), size BIGINT, mime_type VARCHAR(100), storage_path VARCHAR(500), created_at TIMESTAMP DEFAULT NOW()
+                    );
+                    CREATE TABLE IF NOT EXISTS sso_tokens (
+                        id SERIAL PRIMARY KEY,
+                        nonce VARCHAR(64) UNIQUE NOT NULL,
+                        token TEXT NOT NULL,
+                        user_data JSONB NOT NULL,
+                        expires_at TIMESTAMP NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_sso_tokens_nonce ON sso_tokens(nonce);
+                    CREATE INDEX IF NOT EXISTS idx_sso_tokens_expires ON sso_tokens(expires_at);
+                    
+                    CREATE TABLE IF NOT EXISTS passkeys (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                        credential_id TEXT UNIQUE NOT NULL,
+                        public_key TEXT NOT NULL,
+                        counter BIGINT DEFAULT 0,
+                        name VARCHAR(255),
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys(user_id);
+                    CREATE INDEX IF NOT EXISTS idx_passkeys_credential ON passkeys(credential_id);
+
+                    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                        token VARCHAR(64) UNIQUE NOT NULL,
+                        expires_at TIMESTAMP NOT NULL,
+                        used BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_reset_tokens ON password_reset_tokens(token);
+                    CREATE INDEX IF NOT EXISTS idx_reset_expires ON password_reset_tokens(expires_at);
+                    CREATE TABLE IF NOT EXISTS audit_logs (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                        action VARCHAR(50) NOT NULL,
+                        resource_type VARCHAR(50),
+                        resource_id VARCHAR(255),
+                        ip_address VARCHAR(45),
+                        user_agent TEXT,
+                        details JSONB,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
+                    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+                    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
+                    
+                    -- Performance indexen
+                    CREATE INDEX IF NOT EXISTS idx_shares_user_created ON shares(user_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_shares_expires ON shares(expires_at) WHERE expires_at IS NOT NULL;
+                    CREATE INDEX IF NOT EXISTS idx_files_share ON files(share_id);
+                    CREATE INDEX IF NOT EXISTS idx_files_reverse ON files(reverse_share_id);
+                    CREATE INDEX IF NOT EXISTS idx_reverse_user ON reverse_shares(user_id);
+                    CREATE INDEX IF NOT EXISTS idx_contacts_user_email ON contacts(user_id, email);
+                `);
+
+                // 1b. AUTO-HEALING / MIGRATIES (Dit lost je fout op)
+                // We proberen altijd kolommen toe te voegen die in nieuwere versies zijn geïntroduceerd.
+                // 'IF NOT EXISTS' zorgt dat dit geen fout geeft als ze er al zijn.
+                const schemaFixes = [
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS max_downloads INTEGER`,
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS download_count INTEGER DEFAULT 0`,
+                    `ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT`,
+                    `ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN DEFAULT FALSE`,
+                    `ALTER TABLE users ADD COLUMN IF NOT EXISTS backup_codes TEXT`,
+                    `ALTER TABLE reverse_shares ADD COLUMN IF NOT EXISTS thank_you_message TEXT`,
+                    `ALTER TABLE config ADD COLUMN IF NOT EXISTS setup_completed BOOLEAN DEFAULT FALSE`,
+                    `ALTER TABLE config ADD COLUMN IF NOT EXISTS smtp_from TEXT`,
+                    `ALTER TABLE config ADD COLUMN IF NOT EXISTS smtp_starttls BOOLEAN DEFAULT TRUE`,
+                    `ALTER TABLE config ADD COLUMN IF NOT EXISTS smtp_allow_local BOOLEAN DEFAULT FALSE`,
+                    `ALTER TABLE config ADD COLUMN IF NOT EXISTS clamav_must_scan BOOLEAN DEFAULT FALSE`,
+                    `ALTER TABLE config ADD COLUMN IF NOT EXISTS trust_proxy BOOLEAN DEFAULT FALSE`,
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS prezip_status VARCHAR(20)`,
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS prezip_manifest VARCHAR(64)`,
+                    `ALTER TABLE shares ADD COLUMN IF NOT EXISTS prezip_size BIGINT`,
+                    `ALTER TABLE reverse_shares ADD COLUMN IF NOT EXISTS prezip_status VARCHAR(20)`,
+                    `ALTER TABLE reverse_shares ADD COLUMN IF NOT EXISTS prezip_manifest VARCHAR(64)`,
+                    `ALTER TABLE reverse_shares ADD COLUMN IF NOT EXISTS prezip_size BIGINT`,
+                    `ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_groups JSONB`,
+                    `ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_groups_synced_at TIMESTAMPTZ`,
+                ];
+
+                for (const fix of schemaFixes) {
+                    try {
+                        await client.query(fix);
+                    } catch (migrationErr: any) {
+                        // We loggen alleen een waarschuwing, we laten de app niet crashen hierop
+                        console.warn(`⚠️ Auto-fix waarschuwing (niet kritiek): ${migrationErr.message}`);
+                    }
+                }
+
+                try {
+                    const cfgRow = await client.query('SELECT data FROM config WHERE id = 1');
+                    const cfgData = cfgRow.rows[0]?.data;
+                    if (cfgData && typeof cfgData === 'object') {
+                        let changed = false;
+                        if (cfgData.clamavMustScan === true && cfgData.clamavScanInternalShares === undefined) {
+                            cfgData.clamavScanInternalShares = true;
+                            changed = true;
+                        }
+                        if (!Array.isArray(cfgData.ssoAdminGroups)) {
+                            cfgData.ssoAdminGroups = [];
+                            changed = true;
+                        }
+                        if (changed) {
+                            await client.query('UPDATE config SET data = $1 WHERE id = 1', [cfgData]);
+                        }
+                    }
+                } catch (cfgMigrErr: any) {
+                    console.warn(`⚠️ Config JSON migration warning: ${cfgMigrErr.message}`);
+                }
+
+                // 1c. Admin Check & Setup
+                const adminCheck = await client.query('SELECT COUNT(*) FROM users');
+                if (adminCheck.rows && adminCheck.rows.length > 0) {
+                    if (DEMO_MODE) {
+                        const demoHash = await Bun.password.hash('demo');
+                        if (parseInt(adminCheck.rows[0].count) === 0) {
+                            await client.query(
+                                `INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4)`,
+                                ['demo@nexoshare.nl', demoHash, 'Demo Admin', true]
+                            );
+                            console.log('✅ [DEMO] Demo user created: demo@nexoshare.nl / demo');
+                        } else {
+                            await client.query(
+                                `UPDATE users SET password_hash = $1, email = 'demo@nexoshare.nl' WHERE id = 1`,
+                                [demoHash]
+                            );
+                            console.log('✅ [DEMO] User id 1 password reset to "demo" (demo@nexoshare.nl).');
+                        }
+                    } else if (parseInt(adminCheck.rows[0].count) === 0) {
+                        const hash = await Bun.password.hash('admin123');
+                        await client.query(`INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4)`, ['admin@nexoshare.nl', hash, 'Super Admin', true]);
+                        console.log('✅ DB Initialized & Healed. Login: admin@nexoshare.nl / admin123');
+                    } else {
+                        console.log('✅ DB Ready & Up-to-date');
+                    }
+                }
+            } finally {
+                client.release();
+            }
+
+            // STAP 2: Server Starten
+            if (process.argv.length > 2) {
+                await runCLI();
+            } else {
+                if (JWT_SECRET === 'dev-secret-change-me') console.error('⚠️ DEFAULT SECRET IN USE');
+
+                app.use('/api', apiRouter);
+
+                // Multer / upload errors → JSON (never opaque HTML "File too large")
+                app.use('/api', (err: any, _req: any, res: any, next: any) => {
+                    if (!err) return next();
+                    if (err.name === 'MulterError' || err.code === 'LIMIT_FILE_SIZE') {
+                        const maxLabel = DEMO_MODE ? `${DEMO_MAX_FILE_MB} MB` : 'the configured limit';
+                        if (err.code === 'LIMIT_FILE_SIZE') {
+                            return res.status(413).json({ error: `File too large. Maximum ${maxLabel}` });
+                        }
+                        return res.status(400).json({ error: err.message || 'Upload error' });
+                    }
+                    console.error('API error:', err);
+                    if (res.headersSent) return next(err);
+                    res.status(err.status || 500).json({ error: err.message || 'Server error' });
+                });
+
+                // DYNAMIC MANIFEST (PWA)
+                app.get('/site.webmanifest', async (req, res) => {
+                    const config = await getConfig();
+                    const appName = config.appName || 'Nexo Share';
+                    res.json({
+                        "name": appName,
+                        "short_name": appName,
+                        "icons": [
+                            { "src": "/favicon-96x96.png", "sizes": "96x96", "type": "image/png" },
+                            { "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+                            { "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+                            { "src": "/pwa-512x512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+                            { "src": "/pwa-512x512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+                        ],
+                        "start_url": "/",
+                        "display": "standalone",
+                        "background_color": "#09090b",
+                        "theme_color": "#09090b"
+                    });
+                });
+
+                // XSS Preventie op user uploads (SVG scripts blokkeren)
+                app.use('/api/uploads/system', (req, res, next) => {
+                    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+                    next();
+                }, express.static(SYSTEM_DIR));
+                app.use(express.static(path.join(__dirname, '../../frontend/dist')));
+
+                app.get(/(.*)/, publicLimiter, async (req, res) => {
+                    try {
+                        const indexPath = path.join(__dirname, '../../frontend/dist/index.html');
+                        try {
+                            await fs.access(indexPath);
+                        } catch (error) {
+                            console.error('CRITICAL: index.html Not found op:', indexPath);
+                            return res.status(404).send('Frontend build not found.');
+                        }
+                        const html = await fs.readFile(indexPath, 'utf-8');
+                        res.send(html);
+                    } catch (e) {
+                        console.error('Server error while loading frontend:', e);
+                        res.status(500).send('Server Error');
+                    }
+                });
+
+                app.listen(PORT, () => {
+                    console.log(`🚀 API on ${PORT}`);
+                    if (DEMO_MODE) {
+                        console.log(
+                            `📌 DEMO_MODE active — data TTL ~${DEMO_RETENTION_MINUTES} min, upload/scan cap ${DEMO_MAX_FILE_MB} MB (aligned), max users ${DEMO_MAX_USERS}, ClamAV enforced, archive uploads blocked, SSO/password-reset off, risky extensions blocked. (User rows are not auto-deleted; use DB refresh or DEMO_MAX_USERS.)`
+                        );
+                    }
+                });
+            }
+            return; // Succesvolle start, verlaat de retry loop
+
+        } catch (e: any) {
+            console.error(`⚠️ Startup failed: ${e.message}`);
+            retries -= 1;
+            if (retries === 0) { console.error('❌ Exiting after multiple retries.'); process.exit(1); }
+            console.log(`♻️ Retrying in 2 seconds... (${retries} attempts left)`);
+            await new Promise(res => setTimeout(res, 2000));
+        }
+    }
+}
+
+initDB();
+
