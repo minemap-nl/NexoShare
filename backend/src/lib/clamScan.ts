@@ -122,12 +122,15 @@ function isStreamLimitError(message: string): boolean {
 }
 
 function isPropagatedScanError(message: string): boolean {
+    // Do not treat timeout/scanError ("Virus scan timed out...") as already-finalized —
+    // those still need unlink when enforced.
+    if (/timed out/i.test(message)) return false;
     return (
-        message.includes('Virus') ||
-        message.includes('exceeds') ||
-        message.includes('virus scan limit') ||
+        message.includes('Virus detected') ||
+        message.includes('exceeds the virus scan limit') ||
         message.includes('scanner unavailable') ||
-        message.includes('virusscan')
+        message.includes('virusscan') ||
+        message.includes('Upload refused')
     );
 }
 
