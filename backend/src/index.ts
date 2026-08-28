@@ -224,29 +224,46 @@ new NodeClam().init({
 
 const isPrivateIP = (host: string | any) => {
     if (!host || typeof host !== 'string') return true;
-    // 0. Blokkeer vreemde formaten (Hex, Octal, Integer IPs)
-    if (!/^[a-zA-Z0-9.:-]+$/.test(host)) return true;
+    let h = host.trim().toLowerCase();
+    // Strip :port for IPv4 host:port (not IPv6 — those use [addr]:port)
+    if (h.includes('.') && h.includes(':') && !h.startsWith('[')) {
+        h = h.split(':')[0]!;
+    }
+
+    // Reject non-standard IPv4 (leading-zero octets can bypass naive string checks)
+    const ipv4Match = /^(\d{1,3})(?:\.(\d{1,3})){3}$/.exec(h);
+    if (ipv4Match) {
+        const octets = h.split('.');
+        for (const o of octets) {
+            if (o.length > 1 && o.startsWith('0')) return true;
+            const n = Number(o);
+            if (!Number.isInteger(n) || n < 0 || n > 255) return true;
+        }
+        h = octets.map((o) => String(Number(o))).join('.');
+    } else if (!/^[a-zA-Z0-9.:-]+$/.test(h)) {
+        return true;
+    }
 
     // 1. Blokkeer Cloud Metadata Services (Kritiek voor AWS/Azure/GCP)
-    if (host === '169.254.169.254') return true;
-    if (host.toLowerCase().startsWith('fe80:')) return true;
-    if (host.toLowerCase().includes('fd00:ec2')) return true;
+    if (h === '169.254.169.254') return true;
+    if (h.startsWith('fe80:')) return true;
+    if (h.includes('fd00:ec2')) return true;
 
     // 2. Localhost & Standaard Private Ranges
-    if (host === 'localhost') return true;
-    if (host === '0.0.0.0') return true;
-    if (host === '::1') return true; // IPv6 localhost
-    if (host === '::') return true;
+    if (h === 'localhost') return true;
+    if (h === '0.0.0.0') return true;
+    if (h === '::1') return true; // IPv6 localhost
+    if (h === '::') return true;
 
     // IPv4 Private Ranges
-    if (host.startsWith('127.')) return true;
-    if (host.startsWith('10.')) return true;
-    if (host.startsWith('192.168.')) return true;
-    if (host.startsWith('169.254.')) return true; // Link-local IPv4
+    if (h.startsWith('127.')) return true;
+    if (h.startsWith('10.')) return true;
+    if (h.startsWith('192.168.')) return true;
+    if (h.startsWith('169.254.')) return true; // Link-local IPv4
 
     // Class B (172.16.0.0 - 172.31.255.255)
-    if (host.startsWith('172.')) {
-        const parts = host.split('.');
+    if (h.startsWith('172.')) {
+        const parts = h.split('.');
         if (parts.length > 1) {
             const second = parseInt(parts[1], 10);
             if (second >= 16 && second <= 31) return true;
@@ -254,7 +271,7 @@ const isPrivateIP = (host: string | any) => {
     }
 
     // IPv6 Private Ranges (Unique Local Address)
-    if (host.toLowerCase().startsWith('fc') || host.toLowerCase().startsWith('fd')) return true;
+    if (h.startsWith('fc') || h.startsWith('fd')) return true;
 
     return false;
 };
