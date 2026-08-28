@@ -152,3 +152,21 @@ jobs:
           tags: |
             ghcr.io/${{ env.REPO }}:${{ env.NEW_TAG }}
             ghcr.io/${{ env.REPO }}:latest
+
+      # New GHCR packages are private by default — anonymous `podman pull` / `docker pull` fails with 401.
+      - name: Make GHCR package public
+        if: env.PUSH_IMAGE == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKG="${REPO##*/}"
+          API="orgs/${{ github.repository_owner }}/packages/container/${PKG}"
+          VIS=$(gh api "$API" --jq '.visibility' 2>/dev/null || echo "unknown")
+          echo "GHCR ${{ github.repository_owner }}/${PKG} visibility: ${VIS}"
+          if [ "$VIS" = "public" ]; then
+            echo "Already public."
+            exit 0
+          fi
+          gh api --method PATCH "$API" -f visibility=public
+          echo "Package is now public."
