@@ -114,7 +114,7 @@ The recommended way to install **Nexo Share** is via **Docker**.
 ```yaml
 services:
   nexoshare:
-    image: ghcr.io/minemap-nl/nexoshare:v1.06.00 # or :latest
+    image: ghcr.io/minemap-nl/nexoshare:latest
     container_name: nexoshare
     restart: unless-stopped
     ports:
@@ -187,7 +187,7 @@ services:
 ```
 
 
-See [RELEASE_NOTES.md](./RELEASE_NOTES.md) for v1.06 changes.
+See [GitHub Releases](https://github.com/minemap-nl/nexoshare/releases) for v1.06 changes.
 
 4. Start the stack:
 

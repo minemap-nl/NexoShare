@@ -40,5 +40,12 @@ coverage/
 
 .cursor/
 
+# Local git backups (never commit a copied .git folder)
+.git - uit oudere backup*/
+**/.git - */
+
 # Local email template preview (not for GitHub)
 email-preview.html
+
+# Release notes live on GitHub Releases, not in the repo
+RELEASE_NOTES.md
