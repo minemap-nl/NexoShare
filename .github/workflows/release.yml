@@ -4,6 +4,21 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Testmodus"
+        required: true
+        default: dry-run-build
+        type: choice
+        options:
+          - dry-run-build
+          - rebuild-existing-tag
+      tag:
+        description: "Bestaande tag om opnieuw te bouwen (alleen bij rebuild-existing-tag)"
+        required: false
+        default: v1.06.01
+        type: string
 
 permissions:
   contents: write
@@ -12,50 +27,75 @@ permissions:
 jobs:
   version-and-build:
     runs-on: ubuntu-latest
-    # Alleen dependency-updates (Renovate). Feature-bumps (v1.07) blijven handmatig.
+    # Push: alleen Renovate/dependency-commits. Handmatig: workflow_dispatch.
     if: >
-      github.actor == 'renovate[bot]' ||
-      github.actor == 'renovate-bot' ||
-      startsWith(github.event.head_commit.message, 'chore(deps)') ||
-      startsWith(github.event.head_commit.message, 'fix(deps)') ||
-      contains(github.event.head_commit.message, 'renovate')
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'push' &&
+        (
+          github.actor == 'renovate[bot]' ||
+          github.actor == 'renovate-bot' ||
+          startsWith(github.event.head_commit.message, 'chore(deps)') ||
+          startsWith(github.event.head_commit.message, 'fix(deps)') ||
+          contains(github.event.head_commit.message, 'renovate')
+        )
+      )
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'rebuild-existing-tag' && inputs.tag || github.ref }}
 
-      - name: Bepaal laatste v1.XX.YY tag en bump alleen patch
+      - name: Bepaal versienummer
         id: versioning
         run: |
           set -euo pipefail
 
-          # Laatste tag die bij het schema past (negeer oude v.1.06-tags)
-          LATEST_TAG=$(git tag -l 'v1.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
-          if [ -z "${LATEST_TAG}" ]; then
-            LATEST_TAG="v1.06.00"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.mode }}" = "rebuild-existing-tag" ]; then
+              NEW_TAG="${{ inputs.tag }}"
+              WITHOUT_V="${NEW_TAG#v}"
+              NEW_VERSION="${WITHOUT_V}"
+              echo "Handmatige rebuild van bestaande tag: $NEW_TAG"
+            else
+              NEW_TAG="test-build"
+              NEW_VERSION="0.0.0-test"
+              echo "Dry-run build (geen push naar GHCR)"
+            fi
+          else
+            LATEST_TAG=$(git tag -l 'v1.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+            if [ -z "${LATEST_TAG}" ]; then
+              LATEST_TAG="v1.06.00"
+            fi
+            echo "Laatste tag: $LATEST_TAG"
+
+            WITHOUT_V="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR FEATURE PATCH <<< "${WITHOUT_V}"
+            FEATURE="${FEATURE:-0}"
+            PATCH="${PATCH:-0}"
+
+            FEATURE=$((10#$FEATURE))
+            PATCH=$((10#$PATCH))
+            PATCH=$((PATCH + 1))
+
+            NEW_TAG=$(printf "v%d.%02d.%02d" "$MAJOR" "$FEATURE" "$PATCH")
+            NEW_VERSION=$(printf "%d.%02d.%02d" "$MAJOR" "$FEATURE" "$PATCH")
+            echo "Nieuwe dependency-release tag: $NEW_TAG"
           fi
-          echo "Laatste tag: $LATEST_TAG"
-
-          # v1.06 of v1.06.01 → major=1, feature=06, patch=00/01
-          WITHOUT_V="${LATEST_TAG#v}"
-          IFS='.' read -r MAJOR FEATURE PATCH <<< "${WITHOUT_V}"
-          FEATURE="${FEATURE:-0}"
-          PATCH="${PATCH:-0}"
-
-          FEATURE=$((10#$FEATURE))
-          PATCH=$((10#$PATCH))
-          PATCH=$((PATCH + 1))
-
-          NEW_TAG=$(printf "v%d.%02d.%02d" "$MAJOR" "$FEATURE" "$PATCH")
-          NEW_VERSION=$(printf "%d.%02d.%02d" "$MAJOR" "$FEATURE" "$PATCH")
-          echo "Nieuwe tag: $NEW_TAG (version $NEW_VERSION)"
 
           echo "NEW_TAG=$NEW_TAG" >> "$GITHUB_ENV"
           echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
 
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "dry-run-build" ]; then
+            echo "PUSH_IMAGE=false" >> "$GITHUB_ENV"
+          else
+            echo "PUSH_IMAGE=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Sync package.json versions
+        if: github.event_name == 'push'
         run: |
           set -euo pipefail
           for pkg in frontend/package.json backend/package.json; do
@@ -67,6 +107,7 @@ jobs:
           done
 
       - name: Commit version bump (if changed)
+        if: github.event_name == 'push'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -80,6 +121,7 @@ jobs:
           fi
 
       - name: Genereer GitHub Release
+        if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -89,10 +131,10 @@ jobs:
             --notes "Automatic dependency update release (${NEW_TAG})."
 
       - name: Log in to GHCR
+        if: env.PUSH_IMAGE == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          # Eigenaar van de repo, niet renovate[bot] — nodig voor packages:write
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -102,11 +144,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and Push Docker image
+      - name: Build Docker image
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
+          push: ${{ env.PUSH_IMAGE == 'true' }}
           tags: |
             ghcr.io/${{ env.REPO }}:${{ env.NEW_TAG }}
             ghcr.io/${{ env.REPO }}:latest
