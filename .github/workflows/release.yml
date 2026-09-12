@@ -166,13 +166,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
           PKG="${REPO##*/}"
-          API="orgs/${{ github.repository_owner }}/packages/container/${PKG}"
-          VIS=$(gh api "$API" --jq '.visibility' 2>/dev/null || echo "unknown")
-          echo "GHCR ${{ github.repository_owner }}/${PKG} visibility: ${VIS}"
+          OWNER_TYPE=$(gh api "users/${OWNER}" --jq .type)
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            API="orgs/${OWNER}/packages/container/${PKG}"
+          else
+            API="users/${OWNER}/packages/container/${PKG}"
+          fi
+
+          # Package metadata can lag briefly after the first push.
+          VIS=""
+          for _ in 1 2 3 4 5; do
+            VIS=$(gh api "$API" --jq '.visibility' 2>/dev/null || true)
+            if [ -n "$VIS" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "GHCR ${OWNER}/${PKG} (${OWNER_TYPE}) via ${API}: ${VIS:-not-found}"
           if [ "$VIS" = "public" ]; then
             echo "Already public."
             exit 0
           fi
+          if [ -z "$VIS" ]; then
+            echo "Package not readable via Packages API; image push succeeded — skip visibility change."
+            exit 0
+          fi
+
           gh api --method PATCH "$API" -f visibility=public
           echo "Package is now public."
