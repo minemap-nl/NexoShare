@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "postinstall": "node scripts/dedupe-peculiar.mjs",
-    "test": "bun test src/tests/cspPolicy.test.ts src/tests/uploadPathPolicy.test.ts src/tests/nodemailerSmoke.test.ts src/tests/blockedExtensions.test.ts src/tests/clamScan.test.ts src/tests/uploadValidation.test.ts src/tests/ssoGroups.test.ts src/tests/emailTemplate.test.ts",
+    "test": "bun test src/tests/cspPolicy.test.ts src/tests/uploadPathPolicy.test.ts src/tests/nodemailerSmoke.test.ts src/tests/blockedExtensions.test.ts src/tests/clamScan.test.ts src/tests/uploadValidation.test.ts src/tests/ssoGroups.test.ts src/tests/emailTemplate.test.ts src/tests/shareOwnership.test.ts",
     "test:integration": "bun test src/tests/integration.test.ts",
     "test:all": "bun test",
     "generate-env": "node scripts/generate-env.mjs",
@@ -19,23 +19,23 @@
   "type": "commonjs",
   "dependencies": {
     "@peculiar/asn1-schema": "2.9.4",
-    "@simplewebauthn/server": "^13.3.3",
+    "@simplewebauthn/server": "^14.0.3",
     "archiver": "^8.0.0",
     "axios": "^1.20.0",
     "clamscan": "^2.4.0",
     "cors": "^2.8.6",
-    "dotenv": "^17.4.2",
+    "dotenv": "^18.0.4",
     "express": "^5.2.1",
-    "express-rate-limit": "^8.6.2",
+    "express-rate-limit": "^8.7.0",
     "jsonwebtoken": "^9.0.3",
-    "multer": "^2.3.0",
+    "multer": "^2.4.0",
     "node-cron": "^4.6.0",
-    "nodemailer": "^9.1.1",
+    "nodemailer": "^10.0.12",
     "pg": "^8.23.0",
     "qrcode": "^1.5.4",
     "speakeasy": "^2.0.0",
     "validator": "^13.15.35",
-    "zod": "^4.4.3"
+    "zod": "^4.6.5"
   },
   "overrides": {
     "@peculiar/asn1-schema": "2.9.4",
@@ -64,16 +64,16 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.2.0",
-    "@types/node": "^26.4.0",
+    "@types/node": "^26.6.3",
     "@types/node-cron": "^3.0.11",
-    "@types/nodemailer": "^8.0.1",
+    "@types/nodemailer": "^8.0.2",
     "@types/passport": "^1.0.17",
     "@types/passport-openidconnect": "^0.1.3",
     "@types/pg": "^8.23.1",
     "@types/qrcode": "^1.5.6",
     "@types/speakeasy": "^2.0.10",
     "@types/validator": "^13.15.10",
-    "bun-types": "^1.4.0",
+    "bun-types": "^1.4.2",
     "typescript": "^7.0.2"
   }
 }
