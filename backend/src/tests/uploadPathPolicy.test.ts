@@ -20,9 +20,12 @@ describe('uploadPathPolicy', () => {
         const base = path.resolve(tmp, 'base');
         const child = path.join(base, 'file.part');
         const outside = path.resolve(tmp, 'other', 'x');
+        const siblingPrefix = path.resolve(tmp, 'base_evil', 'x');
         expect(isResolvedPathInsideDir(base, child)).toBe(true);
         expect(isResolvedPathInsideDir(base, base)).toBe(true);
         expect(isResolvedPathInsideDir(base, outside)).toBe(false);
+        // Prefix confusion: "/upload/base_evil" must not match "/upload/base"
+        expect(isResolvedPathInsideDir(base, siblingPrefix)).toBe(false);
     });
 
     test('isPathUnderDir requires string under root', () => {

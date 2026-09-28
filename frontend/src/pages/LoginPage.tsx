@@ -40,7 +40,7 @@ export function LoginPage({ onLogin }: any) {
         })
             .then(r => r.json())
             .then(data => {
-                if (data.token && data.user) {
+                if (data.user) {
                     localStorage.setItem('sso_login', 'true');
                     onLogin(data.user);
                     window.history.replaceState({}, document.title, window.location.pathname);

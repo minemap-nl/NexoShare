@@ -1,43 +1,34 @@
 import { useEffect } from 'react';
+import { API_URL } from '../api/constants';
 import { useUI } from '../context/UIContext';
 
-export function useTokenExpiration(token: string | null, logout: () => void) {
+/**
+ * Cookie-based sessions don't expose JWT in JS. Poll /users/me so
+ * expired/invalid cookies still trigger logout.
+ */
+export function useTokenExpiration(_token: string | null, logout: () => void) {
     const { notify } = useUI();
 
     useEffect(() => {
-        if (!token) return;
+        let cancelled = false;
 
-        try {
-            const payload = JSON.parse(atob(token.split('.')[1]));
-            const exp = payload.exp * 1000;
-            const now = Date.now();
-            const timeUntilExpiry = exp - now;
-
-            if (timeUntilExpiry <= 0) {
-                logout();
-                notify('Session expired. Login again.', 'info');
-                return;
+        const checkSession = async () => {
+            try {
+                const res = await fetch(`${API_URL}/users/me`, { credentials: 'include' });
+                if (cancelled) return;
+                if (res.status === 401) {
+                    notify('Session expired. Login again.', 'info');
+                    logout();
+                }
+            } catch {
+                /* network blip — don't force logout */
             }
+        };
 
-            const warningTime = Math.max(0, timeUntilExpiry - 60000);
-            const timeoutIds: ReturnType<typeof setTimeout>[] = [];
-            const warningTimeout = setTimeout(() => {
-                notify('Your session is about to expire. Save your work!', 'info');
-                timeoutIds.push(
-                    setTimeout(() => {
-                        logout();
-                        notify('Session expired. Login again.', 'info');
-                    }, 60000)
-                );
-            }, warningTime);
-            timeoutIds.push(warningTimeout);
-
-            return () => {
-                for (const id of timeoutIds) clearTimeout(id);
-            };
-        } catch (e) {
-            console.error('Token parse error:', e);
-            logout();
-        }
-    }, [token, logout, notify]);
+        const interval = setInterval(() => { void checkSession(); }, 60_000);
+        return () => {
+            cancelled = true;
+            clearInterval(interval);
+        };
+    }, [logout, notify]);
 }

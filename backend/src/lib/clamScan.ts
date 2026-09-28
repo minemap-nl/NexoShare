@@ -160,8 +160,18 @@ export async function scanPathWithClamav(params: ScanPathParams): Promise<void> 
     const enforced = isClamavScanEnforced(config, demoMode, scanContext);
     const maxScanBytes = getMaxScanBytes(config);
 
-    if (fileSizeBytes > maxScanBytes) {
-        const fileSizeMB = (fileSizeBytes / (1024 * 1024)).toFixed(1);
+    // Prefer on-disk size so clients cannot bypass scan limits via declared size.
+    let effectiveSize = fileSizeBytes;
+    try {
+        const { promises: fsp } = await import('fs');
+        const st = await fsp.stat(filePath);
+        if (Number.isFinite(st.size) && st.size >= 0) effectiveSize = st.size;
+    } catch {
+        /* keep declared size */
+    }
+
+    if (effectiveSize > maxScanBytes) {
+        const fileSizeMB = (effectiveSize / (1024 * 1024)).toFixed(1);
         const limitMB = (maxScanBytes / (1024 * 1024)).toFixed(0);
         if (enforced) {
             await unlink(filePath);
@@ -208,7 +218,7 @@ export async function scanPathWithClamav(params: ScanPathParams): Promise<void> 
         if (isPropagatedScanError(msg)) throw e;
 
         if (isStreamLimitError(msg)) {
-            const suggestedMB = Math.ceil(fileSizeBytes / (1024 * 1024)) + 10;
+            const suggestedMB = Math.ceil(effectiveSize / (1024 * 1024)) + 10;
             await unlink(filePath);
             throw new Error(messages.streamLimit(displayName, suggestedMB));
         }

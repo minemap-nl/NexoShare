@@ -39,6 +39,8 @@ export function GuestUploadPage() {
     const [progress, setProgress] = useState(0);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const folderInputRef = useRef<HTMLInputElement>(null);
+    const filesRef = useRef(files);
+    filesRef.current = files;
 
     useEffect(() => {
         // Fetch met error handling
@@ -123,7 +125,7 @@ export function GuestUploadPage() {
             const chunkSizeUnit = (cfg?.chunkSizeUnit as string) || 'MB';
             const CHUNK_SIZE = chunkSizeVal * (sizeMap[chunkSizeUnit] || sizeMap['MB']);
 
-            const uploadableFiles = files.filter(f => !f.isDirectory && f.file && !f.cancelled);
+            const uploadableFiles = filesRef.current.filter(f => !f.isDirectory && f.file && !f.cancelled);
             if (uploadableFiles.length === 0) {
                 notify('No files to upload', 'error');
                 return;
@@ -178,8 +180,8 @@ export function GuestUploadPage() {
             const MAX_PARALLEL = 3;
             
             for (const item of uploadableFiles) {
-                // Check if cancelled
-                const currentFileState = files.find(f => f.id === item.id);
+                // Check if cancelled (use ref — state would be stale inside this async loop)
+                const currentFileState = filesRef.current.find(f => f.id === item.id);
                 if (!currentFileState || currentFileState.cancelled) continue;
                 
                 const file = item.file as File;
@@ -217,7 +219,7 @@ export function GuestUploadPage() {
                     ));
                 }
                 
-                const fileState = files.find(f => f.id === item.id);
+                const fileState = filesRef.current.find(f => f.id === item.id);
                 if (!fileState?.cancelled) {
                     uploadedFilesMeta.push({ fileName: file.name, originalName: item.path, fileId: fileId, size: file.size, mimeType: file.type });
                 }
@@ -416,7 +418,17 @@ export function GuestUploadPage() {
                                                     )}
                                                     <button onClick={(e) => {
                                                         e.stopPropagation();
-                                                        setFiles(prev => prev.filter(x => x.id !== item.id && !x.path.startsWith(item.path + '/')));
+                                                        if (uploading) {
+                                                            setFiles(prev => prev.map(f =>
+                                                                (f.id === item.id || f.path.startsWith(item.path + '/'))
+                                                                    ? { ...f, cancelled: true }
+                                                                    : f
+                                                            ));
+                                                            const abortCtrl = (window as any).__uploadAbortController;
+                                                            if (abortCtrl) abortCtrl.abort();
+                                                        } else {
+                                                            setFiles(prev => prev.filter(x => x.id !== item.id && !x.path.startsWith(item.path + '/')));
+                                                        }
                                                     }} className="text-neutral-500 hover:text-red-400 p-2 transition flex-shrink-0"><X className="w-4 h-4 md:w-5 md:h-5" /></button>
                                                 </div>
                                             </div>

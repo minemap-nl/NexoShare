@@ -5,6 +5,7 @@ import {
     Loader2,
     Shield,
 } from 'lucide-react';
+import axios from 'axios';
 import { API_URL } from '../api/constants';
 import { isAllowedBrandingUrl } from '../lib';
 import { useAppConfig } from '../context/AppConfigContext';
@@ -44,7 +45,6 @@ export function Dashboard({ token, logout }: any) {
             setView('config');
         }
     }, [user]);
-    useTokenExpiration(token, logout);
 
     useEffect(() => {
         const check2FA = async () => {
@@ -66,30 +66,37 @@ export function Dashboard({ token, logout }: any) {
         check2FA();
     }, []);
 
-    const handleLogout = useCallback(() => {
+    const handleLogout = useCallback(async () => {
         const isSsoLogin = localStorage.getItem('sso_login') === 'true';
-        if (isSsoLogin && config.ssoEnabled && config.ssoLogoutUrl && config.ssoLogoutUrl.trim() !== '') {
-            localStorage.removeItem('token');
-            localStorage.removeItem('user');
-            localStorage.removeItem('sso_login');
-            // Prevent Open Redirect via Helper
+        const logoutUrl = config.ssoLogoutUrl;
+
+        try {
+            await fetch(`${API_URL}/auth/logout`, { method: 'POST', credentials: 'include' });
+        } catch (e) {
+            console.error('Logout request failed', e);
+        }
+
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        localStorage.removeItem('sso_login');
+
+        if (isSsoLogin && config.ssoEnabled && logoutUrl && logoutUrl.trim() !== '') {
             try {
-                const logoutUrl = config.ssoLogoutUrl;
-                // Strict HTTP/HTTPS validation (Regex) before assign
-                if (logoutUrl && /^https?:\/\//i.test(logoutUrl)) {
+                if (/^https?:\/\//i.test(logoutUrl)) {
                     window.location.assign(logoutUrl);
-                } else {
-                    window.location.reload();
+                    return;
                 }
             } catch (e) {
-                window.location.reload();
+                /* fall through */
             }
-        } else {
-            logout();
         }
-    }, [config.ssoEnabled, config.ssoLogoutUrl, logout]);
 
-    /** Patched fetch runs with an effect that only mounts once — always call latest logout logic (SSO vs local). */
+        window.location.href = '/login';
+    }, [config.ssoEnabled, config.ssoLogoutUrl]);
+
+    useTokenExpiration(token, handleLogout);
+
+    /** Patched fetch / axios run with an effect that only mounts once — always call latest logout logic (SSO vs local). */
     const handleLogoutRef = useRef(handleLogout);
     handleLogoutRef.current = handleLogout;
 
@@ -113,13 +120,29 @@ export function Dashboard({ token, logout }: any) {
         window.fetch = async (...args) => {
             const response = await originalFetch(...args);
             if (response.status === 401) {
-                if (!args[0].toString().includes('logout')) {
+                if (!args[0].toString().includes('logout') && !args[0].toString().includes('/users/me')) {
                     handleLogoutRef.current();
                 }
             }
             return response;
         };
-        return () => { window.fetch = originalFetch; };
+
+        const interceptorId = axios.interceptors.response.use(
+            (r) => r,
+            (error) => {
+                const status = error?.response?.status;
+                const url = String(error?.config?.url || '');
+                if (status === 401 && !url.includes('logout') && !url.includes('/users/me')) {
+                    handleLogoutRef.current();
+                }
+                return Promise.reject(error);
+            }
+        );
+
+        return () => {
+            window.fetch = originalFetch;
+            axios.interceptors.response.eject(interceptorId);
+        };
     }, []);
 
     const handleUploadSurfaceChange = useCallback((s: { showSuccess: boolean }) => {

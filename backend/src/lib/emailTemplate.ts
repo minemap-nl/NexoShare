@@ -55,6 +55,10 @@ export function resolveEmailLogoSrc(logoUrl: string | undefined | null, baseUrl:
 export type BuildEmailHtmlOptions = {
     appName: string;
     subject: string;
+    /**
+     * HTML fragment for the email body. Callers MUST escape any user-controlled
+     * text before interpolation (see escapeHtml at call sites in index.ts).
+     */
     bodyHtml: string;
     ctaLink?: string;
     ctaText?: string;

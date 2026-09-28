@@ -56,6 +56,33 @@ import {
     tryStreamPrezip,
     type PrezipType,
 } from './lib/sharePrezip';
+import { evaluateShareOwnership } from './lib/shareOwnership';
+
+/** Directories under UPLOAD_DIR that are not share folders. */
+const UPLOAD_SYSTEM_DIRS = new Set(['temp', 'system', 'guest_uploads', 'share_zips']);
+
+/** Valid bcrypt hash used only to equalize login timing when the user does not exist. */
+let loginTimingDummyHashPromise: Promise<string> | null = null;
+const getLoginTimingDummyHash = () => {
+    if (!loginTimingDummyHashPromise) {
+        loginTimingDummyHashPromise = Bun.password.hash(
+            `timing-pad-${crypto.randomBytes(32).toString('hex')}`
+        );
+    }
+    return loginTimingDummyHashPromise;
+};
+
+const getSessionCookieOptions = (config: { secureCookies?: boolean; appUrl?: string }, maxAge: number) => {
+    const isProduction = process.env.NODE_ENV === 'production';
+    const forceSecure = !!(config.secureCookies || (config.appUrl && String(config.appUrl).startsWith('https://')));
+    return {
+        httpOnly: true as const,
+        secure: isProduction || forceSecure,
+        sameSite: (isProduction ? 'strict' : 'lax') as 'strict' | 'lax',
+        maxAge,
+        path: '/',
+    };
+};
 
 dotenv.config();
 
@@ -174,9 +201,14 @@ const pool = new Pool({
     query_timeout: 300000,     // 5 minuten
     statement_timeout: 300000, // 5 minuten
     ssl: process.env.DB_SSL === 'true' ? {
-        rejectUnauthorized: false
+        // Default verifies certs; set DB_SSL_REJECT_UNAUTHORIZED=false only for trusted private CAs.
+        rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false'
     } : false
 });
+
+if (process.env.DB_SSL === 'true' && process.env.DB_SSL_REJECT_UNAUTHORIZED === 'false') {
+    console.warn('⚠️ DB_SSL_REJECT_UNAUTHORIZED=false: PostgreSQL TLS certificate is not verified (MITM risk).');
+}
 
 // Error handling voor database pool
 pool.on('error', (err) => {
@@ -225,8 +257,13 @@ new NodeClam().init({
 const isPrivateIP = (host: string | any) => {
     if (!host || typeof host !== 'string') return true;
     let h = host.trim().toLowerCase();
+    // Bracketed IPv6 literals: [::1], [::ffff:127.0.0.1]
+    if (h.startsWith('[') && h.includes(']')) {
+        const end = h.indexOf(']');
+        h = h.slice(1, end);
+    }
     // Strip :port for IPv4 host:port (not IPv6 — those use [addr]:port)
-    if (h.includes('.') && h.includes(':') && !h.startsWith('[')) {
+    if (h.includes('.') && h.includes(':') && !h.includes('::')) {
         h = h.split(':')[0]!;
     }
 
@@ -268,6 +305,22 @@ const isPrivateIP = (host: string | any) => {
             const second = parseInt(parts[1], 10);
             if (second >= 16 && second <= 31) return true;
         }
+    }
+
+    // IPv4-mapped IPv6 (::ffff:127.0.0.1 / ::ffff:10.0.0.1)
+    const v4MappedDotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(h);
+    if (v4MappedDotted) return isPrivateIP(v4MappedDotted[1]);
+
+    // IPv4-mapped IPv6 hex form (::ffff:7f00:1)
+    const v4MappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(h);
+    if (v4MappedHex) {
+        const hi = parseInt(v4MappedHex[1], 16);
+        const lo = parseInt(v4MappedHex[2], 16);
+        if (Number.isFinite(hi) && Number.isFinite(lo)) {
+            const dotted = `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+            return isPrivateIP(dotted);
+        }
+        return true;
     }
 
     // IPv6 Private Ranges (Unique Local Address)
@@ -325,14 +378,7 @@ const cleanupOrphanedFolders = async () => {
         // 1. Haal alle mapnamen op uit de uploads folder
         const dirents = await fs.readdir(UPLOAD_DIR, { withFileTypes: true });
         const folders = dirents
-            // VOEG HIER JE MAP TOE AAN DE UITZONDERINGEN:
-            .filter(dirent =>
-                dirent.isDirectory() &&
-                dirent.name !== 'temp' &&
-                dirent.name !== 'guest_uploads' &&
-                dirent.name !== 'system' &&
-                dirent.name !== 'share_zips'
-            )
+            .filter(dirent => dirent.isDirectory() && !UPLOAD_SYSTEM_DIRS.has(dirent.name))
             .map(dirent => dirent.name);
 
         if (folders.length === 0) return;
@@ -399,7 +445,7 @@ const cleanupOrphanedShareFiles = async () => {
     console.log('🧹 Start checking for orphan files in shares...');
     try {
         const shareDirs = (await fs.readdir(UPLOAD_DIR, { withFileTypes: true }))
-            .filter(dirent => dirent.isDirectory() && !['temp', 'system', 'guest_uploads'].includes(dirent.name))
+            .filter(dirent => dirent.isDirectory() && !UPLOAD_SYSTEM_DIRS.has(dirent.name))
             .map(dirent => dirent.name);
 
         for (const shareId of shareDirs) {
@@ -690,8 +736,7 @@ const safeUnlink = async (filePath: string) => {
         const allowUpload = path.resolve(UPLOAD_DIR);
         const allowTemp = path.resolve(TEMP_DIR);
 
-        // Ensure path is within allowed dirs
-        if (!resolved.startsWith(allowUpload) && !resolved.startsWith(allowTemp)) {
+        if (!isResolvedPathInsideDir(allowUpload, resolved) && !isResolvedPathInsideDir(allowTemp, resolved)) {
             console.error(`Blocked unsafe unlink: ${resolved}`);
             return;
         }
@@ -1113,7 +1158,10 @@ function createSmtpTransportOptions(opts: {
         port: opts.port,
         secure: opts.secure,
         auth: opts.auth,
-        tls: { rejectUnauthorized: false },
+        tls: {
+            // Set SMTP_TLS_REJECT_UNAUTHORIZED=false only for trusted internal relays with private CAs.
+            rejectUnauthorized: process.env.SMTP_TLS_REJECT_UNAUTHORIZED !== 'false',
+        },
         connectionTimeout: 25_000,
         greetingTimeout: 20_000,
         socketTimeout: 60_000,
@@ -1233,7 +1281,8 @@ const authenticateToken: RequestHandler = (req, res, next) => {
     if (!token) { res.status(401).json({ error: 'Access denied' }); return; }
 
     jwt.verify(token, JWT_SECRET, (err: any, decoded: any) => {
-        if (err) { res.status(403).json({ error: 'Invalid token' }); return; }
+        // 401 (not 403): invalid/expired session should trigger client logout; 403 is for insufficient privileges.
+        if (err) { res.status(401).json({ error: 'Invalid token' }); return; }
         (req as AuthRequest).user = decoded as JWTPayload;
         next();
     });
@@ -1475,7 +1524,7 @@ apiRouter.post('/auth/login', loginLimiter, async (req, res) => {
         // Als user niet bestaat, doen we TOCH een compare tegen een dummy hash
         // zodat de responstijd altijd ongeveer gelijk is.
         if (result.rows.length === 0) {
-            await Bun.password.verify(password, '$2b$10$Xw.sY.f/O/W.S/./././././././././././././././.');
+            await Bun.password.verify(password, await getLoginTimingDummyHash());
             return res.status(401).json({ error: genericError });
         }
 
@@ -1494,23 +1543,11 @@ apiRouter.post('/auth/login', loginLimiter, async (req, res) => {
         if (config.require2FA && !user.totp_enabled) {
             const token = jwt.sign({ id: user.id, email: user.email, isAdmin: user.is_admin }, JWT_SECRET, { expiresIn: '15m' });
 
-            // --- OOK HIER HET COOKIE ZETTEN ---
-            // Dit is nodig zodat de vervolg-call naar '/auth/2fa/setup' geautoriseerd is
-            const isProduction = process.env.NODE_ENV === 'production';
-            const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
-
-            // Let op: we gebruiken hier de '15m' expiry van het tijdelijke token
-            res.cookie('token', token, {
-                httpOnly: true,
-                secure: process.env.NODE_ENV === 'production',
-                sameSite: isProduction ? 'strict' : 'lax',
-                maxAge: 15 * 60 * 1000 // 15 Minutes
-            });
+            // Cookie needed so follow-up '/auth/2fa/setup' is authorized
+            res.cookie('token', token, getSessionCookieOptions(config, 15 * 60 * 1000));
 
             return res.json({
                 requiresSetup2FA: true,
-                // tempToken mag blijven voor legacy, maar cookie doet het werk
-                tempToken: token,
                 user: { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin }
             });
         }
@@ -1518,17 +1555,7 @@ apiRouter.post('/auth/login', loginLimiter, async (req, res) => {
         const token = jwt.sign({ id: user.id, email: user.email, isAdmin: user.is_admin }, JWT_SECRET, { expiresIn: getTimeInMs(config.sessionVal, config.sessionUnit) / 1000 });
         await logAudit(user.id, 'login', 'user', user.id.toString(), req);
 
-        // Bepaal of we lokaal draaien
-        // Als we GEEN https gebruiken (lokaal), moet secure FALSE zijn en SameSite LAX
-        const isProduction = process.env.NODE_ENV === 'production';
-        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
-
-        res.cookie('token', token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: isProduction ? 'strict' : 'lax',
-            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
-        });
+        res.cookie('token', token, getSessionCookieOptions(config, getTimeInMs(config.sessionVal, config.sessionUnit)));
 
         // Stuur user info terug, maar GEEN token in de body (zodat frontend het niet in localStorage zet)
         res.json({ success: true, user: { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin } });
@@ -1542,11 +1569,12 @@ apiRouter.post('/auth/logout', async (req, res) => {
         const config = await getConfig();
 
         // 2. Clear de cookie met EXACT dezelfde instellingen als bij het inloggen
+        const cookieOpts = getSessionCookieOptions(config, 0);
         res.clearCookie('token', {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'strict',
-            path: '/'
+            httpOnly: cookieOpts.httpOnly,
+            secure: cookieOpts.secure,
+            sameSite: cookieOpts.sameSite,
+            path: cookieOpts.path,
         });
 
         res.json({ success: true });
@@ -1609,17 +1637,9 @@ apiRouter.post('/auth/verify-2fa', loginLimiter, async (req, res) => {
 
         await logAudit(user.id, 'login_2fa', 'user', user.id.toString(), req);
 
-        const isProduction = process.env.NODE_ENV === 'production';
-        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+        res.cookie('token', token, getSessionCookieOptions(config, getTimeInMs(config.sessionVal, config.sessionUnit)));
 
-        res.cookie('token', token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: isProduction ? 'strict' : 'lax',
-            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
-        });
-
-        res.json({ token, user: { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin } });
+        res.json({ success: true, user: { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin } });
     } catch (e) {
         console.error(e);
         res.status(500).json({ error: 'Server error' });
@@ -1955,15 +1975,7 @@ apiRouter.post('/passkeys/auth/verify', async (req, res) => {
             delete req.app.locals[`auth_challenge_${response.response.challenge}`];
 
             // COOKIE ZETTEN (Net als bij SSO en Login)
-            const isProduction = process.env.NODE_ENV === 'production';
-            const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
-
-            res.cookie('token', token, {
-                httpOnly: true,
-                secure: process.env.NODE_ENV === 'production',
-                sameSite: isProduction ? 'strict' : 'lax',
-                maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
-            });
+            res.cookie('token', token, getSessionCookieOptions(config, getTimeInMs(config.sessionVal, config.sessionUnit)));
 
             res.json({
                 user: { id: passkey.user_id, email: passkey.email, name: passkey.name, is_admin: passkey.is_admin }
@@ -2068,23 +2080,30 @@ apiRouter.post('/auth/password-reset/complete', async (req, res) => {
             return res.status(400).json({ error: passwordCheck.error });
         }
 
-        const result = await pool.query(
-            'SELECT user_id, expires_at, used FROM password_reset_tokens WHERE token = $1',
-            [token]
-        );
-
-        if (result.rows.length === 0 || result.rows[0].used) {
-            return res.status(400).json({ error: 'Invalid or expired token' });
-        }
-
-        if (new Date() > new Date(result.rows[0].expires_at)) {
-            return res.status(400).json({ error: 'Token expired' });
-        }
-
         const hash = await Bun.password.hash(password);
 
-        await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, result.rows[0].user_id]);
-        await pool.query('UPDATE password_reset_tokens SET used = TRUE WHERE token = $1', [token]);
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const claim = await client.query(
+                `UPDATE password_reset_tokens
+                 SET used = TRUE
+                 WHERE token = $1 AND used = FALSE AND expires_at > NOW()
+                 RETURNING user_id`,
+                [token]
+            );
+            if (claim.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Invalid or expired token' });
+            }
+            await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, claim.rows[0].user_id]);
+            await client.query('COMMIT');
+        } catch (e) {
+            try { await client.query('ROLLBACK'); } catch { /* noop */ }
+            throw e;
+        } finally {
+            client.release();
+        }
 
         res.json({ success: true });
     } catch (e) {
@@ -2192,7 +2211,12 @@ apiRouter.get('/auth/sso', async (req, res) => {
         const targetUrl = `${issuerOrigin}/application/o/authorize/?${params.toString()}`;
 
         // Zet een tijdelijke cookie om CSRF te voorkomen
-        res.cookie('sso_init', '1', { httpOnly: true, maxAge: 300000, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' || config.secureCookies });
+        res.cookie('sso_init', '1', {
+            httpOnly: true,
+            maxAge: 300000,
+            sameSite: 'lax',
+            secure: getSessionCookieOptions(config, 300000).secure,
+        });
 
         // Validate Target URL to prevent Open Redirect
         // Validate Target URL to prevent Open Redirect
@@ -2404,17 +2428,10 @@ apiRouter.post('/auth/sso-exchange', async (req, res) => {
 
         // COOKIE INSTELLEN
         const config = await getConfig();
-        const isProduction = process.env.NODE_ENV === 'production';
-        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
 
-        res.cookie('token', token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: isProduction ? 'strict' : 'lax',
-            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
-        });
+        res.cookie('token', token, getSessionCookieOptions(config, getTimeInMs(config.sessionVal, config.sessionUnit)));
 
-        res.json({ token, user: user_data });
+        res.json({ success: true, user: user_data });
     } catch (e: any) {
         console.error('[SSO Exchange Error]:', e.message);
         res.status(500).json({ error: 'Token uitwisseling failed' });
@@ -2488,7 +2505,11 @@ apiRouter.get('/config', async (req, res) => {
 // Checkt: Mag dit verzoek? (Ja als setup nog niet klaar is, anders alleen Admin)
 const checkConfigPermission = async (req: Request, res: Response): Promise<boolean> => {
     const config = await getConfig();
-    if (!config.setupCompleted) return true; // Setup mode: Alles mag
+    // Setup mode only while no users exist yet — once an admin exists, require admin auth even if setupCompleted is still false.
+    if (!config.setupCompleted) {
+        const ur = await pool.query('SELECT COUNT(*)::int AS c FROM users');
+        if ((ur.rows[0]?.c || 0) === 0) return true;
+    }
 
     // Normale mode: Check Admin Token
     const cookies = parseCookies(req);
@@ -2499,7 +2520,7 @@ const checkConfigPermission = async (req: Request, res: Response): Promise<boole
         if (!decoded.isAdmin) { res.status(403).json({ error: 'Admin required' }); return false; }
         (req as AuthRequest).user = decoded;
         return true;
-    } catch (e) { res.status(403).json({ error: 'Invalid token' }); return false; }
+    } catch (e) { res.status(401).json({ error: 'Invalid token' }); return false; }
 };
 
 // SYSTEM BRANDING UPLOAD
@@ -2760,54 +2781,74 @@ apiRouter.get('/users', authenticateToken, requireAdmin, async (req, res) => {
 });
 
 apiRouter.post('/users', async (req, res) => {
-    // SECURITY Allow creation without token ONLY if DB is empty (First Setup)
-    const countCheck = await pool.query('SELECT COUNT(*) FROM users');
-    const userCount = parseInt(countCheck.rows[0].count);
-
-    if (DEMO_MODE && userCount >= DEMO_MAX_USERS) {
-        return res.status(403).json({ error: `Demo mode: maximum ${DEMO_MAX_USERS} user account(s) allowed.` });
-    }
-
-    if (userCount > 0) {
-        // Normal flow: Check Token & Admin rights manually since we removed middleware
-        const cookies = parseCookies(req);
-        const token = cookies.token || req.headers['authorization']?.split(' ')[1];
-        if (!token) return res.status(401).json({ error: 'Access denied' });
-        try {
-            const decoded: any = jwt.verify(token, JWT_SECRET);
-            if (!decoded.isAdmin) return res.status(403).json({ error: 'Admin required' });
-            (req as AuthRequest).user = decoded;
-        } catch (e) { return res.status(403).json({ error: 'Invalid token' }); }
-    }
-
-    const { email, password, name, is_admin } = req.body;
-
-    // Validate email
-    if (!isValidEmail(email)) {
-        return res.status(400).json({ error: 'Invalid email address' });
-    }
-
-    // Validate password strength
-    const passwordCheck = isStrongPassword(password);
-    if (!passwordCheck.valid) {
-        return res.status(400).json({ error: passwordCheck.error });
-    }
-
-    const hash = await Bun.password.hash(password);
-    const effectiveIsAdmin = userCount === 0 ? true : !!is_admin;
+    const client = await pool.connect();
     try {
-        const result = await pool.query(
+        await client.query('BEGIN');
+        // Serialize first-user creation so concurrent setup cannot create multiple admins.
+        await client.query('LOCK TABLE users IN EXCLUSIVE MODE');
+
+        const countCheck = await client.query('SELECT COUNT(*) FROM users');
+        const userCount = parseInt(countCheck.rows[0].count);
+
+        if (DEMO_MODE && userCount >= DEMO_MAX_USERS) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: `Demo mode: maximum ${DEMO_MAX_USERS} user account(s) allowed.` });
+        }
+
+        if (userCount > 0) {
+            // Normal flow: Check Token & Admin rights manually since we removed middleware
+            const cookies = parseCookies(req);
+            const token = cookies.token || req.headers['authorization']?.split(' ')[1];
+            if (!token) {
+                await client.query('ROLLBACK');
+                return res.status(401).json({ error: 'Access denied' });
+            }
+            try {
+                const decoded: any = jwt.verify(token, JWT_SECRET);
+                if (!decoded.isAdmin) {
+                    await client.query('ROLLBACK');
+                    return res.status(403).json({ error: 'Admin required' });
+                }
+                (req as AuthRequest).user = decoded;
+            } catch (e) {
+                await client.query('ROLLBACK');
+                return res.status(401).json({ error: 'Invalid token' });
+            }
+        }
+
+        const { email, password, name, is_admin } = req.body;
+
+        // Validate email
+        if (!isValidEmail(email)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Invalid email address' });
+        }
+
+        // Validate password strength
+        const passwordCheck = isStrongPassword(password);
+        if (!passwordCheck.valid) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: passwordCheck.error });
+        }
+
+        const hash = await Bun.password.hash(password);
+        const effectiveIsAdmin = userCount === 0 ? true : !!is_admin;
+        const result = await client.query(
             'INSERT INTO users (email, password_hash, name, is_admin) VALUES ($1, $2, $3, $4) RETURNING id',
             [email, hash, name, effectiveIsAdmin]
         );
+        await client.query('COMMIT');
         await logAudit((req as AuthRequest).user?.id ?? null, 'user_created', 'user', result.rows[0].id.toString(), req, {
             email,
             is_admin: effectiveIsAdmin
         });
         res.json({ success: true });
     } catch (e) {
+        try { await client.query('ROLLBACK'); } catch { /* noop */ }
         console.error(e);
         res.status(500).json({ error: 'Could not create user' });
+    } finally {
+        client.release();
     }
 });
 
@@ -2887,15 +2928,7 @@ apiRouter.put('/users/profile', authenticateToken, async (req, res) => {
             { expiresIn: getTimeInMs(config.sessionVal, config.sessionUnit) / 1000 }
         );
 
-        const isProduction = process.env.NODE_ENV === 'production';
-        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
-
-        res.cookie('token', token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: isProduction ? 'strict' : 'lax',
-            maxAge: getTimeInMs(config.sessionVal, config.sessionUnit)
-        });
+        res.cookie('token', token, getSessionCookieOptions(config, getTimeInMs(config.sessionVal, config.sessionUnit)));
 
         res.json({ success: true, user: updatedUser });
     } catch (e: any) {
@@ -3176,9 +3209,17 @@ const chunkUploadPublic = multer({
 
 apiRouter.post('/shares/:id/chunk', authenticateToken, uploadLimiter, chunkUploadAuth.single('chunk'), async (req, res) => {
     const { id } = req.params;
+    const authReq = req as AuthRequest;
 
     // Security: Validate ID format before touching FS
     if (!isValidId(id)) return res.status(400).json({ error: 'Invalid Share ID format' });
+
+    const ownerRes = await pool.query('SELECT user_id FROM shares WHERE id = $1', [id]);
+    const ownership = evaluateShareOwnership(ownerRes.rows[0], authReq.user!.id);
+    if (!ownership.ok) {
+        if (req.file) await safeUnlink(req.file.path);
+        return res.status(ownership.status).json({ error: ownership.error });
+    }
 
     const { fileName, chunkIndex, fileId, chunkHash } = req.body;
     if (!isValidId(fileId)) return res.status(400).json({ error: 'Invalid File ID format' });
@@ -3329,25 +3370,29 @@ apiRouter.post('/shares/:id/chunk', authenticateToken, uploadLimiter, chunkUploa
 // STAP 3: Finalize (Verplaatsen, Scannen, Database, Email)
 apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (req, res) => {
     const { id } = req.params;
+    const authReq = req as AuthRequest;
 
     // Security: Validate ID format
     if (!isValidId(id)) return res.status(400).json({ error: 'Invalid Share ID format' });
 
     const { files } = req.body;
     if (!Array.isArray(files)) return res.status(400).json({ error: 'Invalid files data' });
+
+    const ownerRes = await pool.query('SELECT user_id FROM shares WHERE id = $1', [id]);
+    const ownership = evaluateShareOwnership(ownerRes.rows[0], authReq.user!.id);
+    if (!ownership.ok) return res.status(ownership.status).json({ error: ownership.error });
     
     // If no files (all cancelled), delete the share and return
     if (files.length === 0) {
         clearUploadSessionKeys(id);
         await unlinkTempPartFilesForShare(id);
-        await pool.query('DELETE FROM shares WHERE id = $1', [id]);
+        await pool.query('DELETE FROM shares WHERE id = $1 AND user_id = $2', [id, authReq.user!.id]);
         return res.json({ success: true, empty: true, shareUrl: null });
     }
     
     for (const f of files) {
         if (!isValidId(f.fileId)) return res.status(400).json({ error: 'Invalid File ID format' });
     }
-    const authReq = req as AuthRequest;
 
     const client = await pool.connect();
     const movedStoragePaths: string[] = [];
@@ -3499,9 +3544,23 @@ apiRouter.post('/shares/:id/finalize', authenticateToken, uploadLimiter, async (
 apiRouter.put('/shares/:id', authenticateToken, uploadLimiter, checkUploadLimits, upload.array('files'), handleUploadId, async (req, res) => {
     const client = await pool.connect();
     const authReq = req as AuthRequest;
+    const unlinkUploaded = async () => {
+        if (authReq.files && Array.isArray(authReq.files)) {
+            for (const f of authReq.files as Express.Multer.File[]) {
+                await safeUnlink(f.path);
+            }
+        }
+    };
     try {
         const { name, expiration, password, customSlug, remove_password, staged_files } = authReq.body; // remove_password en staged_files toegevoegd
         const currentId = authReq.params.id;
+
+        const ownerRes = await client.query('SELECT user_id FROM shares WHERE id = $1', [currentId]);
+        const ownership = evaluateShareOwnership(ownerRes.rows[0], authReq.user!.id);
+        if (!ownership.ok) {
+            await unlinkUploaded();
+            return res.status(ownership.status).json({ error: ownership.error });
+        }
 
         // --- SCAN FILES ---
         if (authReq.files) {
@@ -3516,13 +3575,20 @@ apiRouter.put('/shares/:id', authenticateToken, uploadLimiter, checkUploadLimits
 
         let newId = currentId;
         if (customSlug && customSlug !== currentId) {
-            if (!isValidSlug(customSlug)) return res.status(400).json({ error: 'Invalid characters in link.' });
+            if (!isValidSlug(customSlug)) {
+                await unlinkUploaded();
+                return res.status(400).json({ error: 'Invalid characters in link.' });
+            }
             const check = await client.query('SELECT id FROM shares WHERE id = $1', [customSlug]);
-            if (check.rows.length > 0) return res.status(409).json({ error: 'Link is already in use' });
+            if (check.rows.length > 0) {
+                await unlinkUploaded();
+                return res.status(409).json({ error: 'Link is already in use' });
+            }
             newId = customSlug;
         }
 
         if (newId !== currentId && uploadSessionBudget.has(currentId)) {
+            await unlinkUploaded();
             return res.status(409).json({
                 error: 'Cannot change the share link while a file upload is still in progress for this share. Wait until the upload finishes.'
             });
@@ -3575,7 +3641,7 @@ apiRouter.put('/shares/:id', authenticateToken, uploadLimiter, checkUploadLimits
 
         await client.query('BEGIN');
 
-        // Als het ID verandert, hernoem de map en update paden
+        // Als het ID verandert, hernoem de map en update paden + DB share id
         if (newId !== currentId) {
             const oldPath = path.join(UPLOAD_DIR, currentId);
             const newPath = path.join(UPLOAD_DIR, newId);
@@ -3595,10 +3661,22 @@ apiRouter.put('/shares/:id', authenticateToken, uploadLimiter, checkUploadLimits
                 // Negeer error als map niet bestaat (lege share), anders loggen
                 if (err.code !== 'ENOENT') console.error('Fout bij hernoemen map:', err);
             }
+
+            await client.query(
+                `UPDATE files SET share_id = $1 WHERE share_id = $2`,
+                [newId, currentId]
+            );
+            const idUpdate = await client.query(
+                `UPDATE shares SET id = $1 WHERE id = $2 AND user_id = $3 RETURNING id`,
+                [newId, currentId, authReq.user!.id]
+            );
+            if (idUpdate.rows.length === 0) {
+                throw new Error('Access denied');
+            }
         }
 
         if (updates.length > 0) {
-            values.push(currentId);
+            values.push(newId);
             values.push(authReq.user!.id);
             // Let op: index i en i+1 gebruiken voor WHERE clause
             await client.query(`UPDATE shares SET ${updates.join(', ')} WHERE id = $${i++} AND user_id = $${i++}`, values);
@@ -3724,11 +3802,16 @@ apiRouter.post('/shares/:id/resend', authenticateToken, async (req, res) => {
 // STAGE: Bestanden samenvoegen in TEMP maar nog niet aan share koppelen (preview mogelijk maken)
 apiRouter.post('/shares/:id/stage', authenticateToken, uploadLimiter, async (req, res) => {
     const { id } = req.params;
+    const authReq = req as AuthRequest;
     if (!isValidId(id)) return res.status(400).json({ error: 'Invalid Share ID format' });
     const { files } = req.body; // Array of {fileName, fileId, size, mimeType}
     if (!Array.isArray(files) || files.length === 0) {
         return res.status(400).json({ error: 'Invalid or empty files data' });
     }
+
+    const ownerRes = await pool.query('SELECT user_id FROM shares WHERE id = $1', [id]);
+    const ownership = evaluateShareOwnership(ownerRes.rows[0], authReq.user!.id);
+    if (!ownership.ok) return res.status(ownership.status).json({ error: ownership.error });
 
     // We gebruiken hier GEEN DB transactie of cleaning, want het is temporary.
     // De 'cleanup' job verwijdert oude meuk uit temp wel.
@@ -3824,7 +3907,7 @@ apiRouter.get('/shares/preview-stage/:tempId', authenticateToken, downloadLimite
     const filePath = path.join(TEMP_DIR, tempId);
 
     // Extra path traversal check
-    if (!path.resolve(filePath).startsWith(path.resolve(TEMP_DIR))) {
+    if (!isResolvedPathInsideDir(TEMP_DIR, filePath)) {
         return res.status(403).send('Invalid path');
     }
     try {
@@ -3899,7 +3982,11 @@ apiRouter.get('/shares/:id/download', downloadLimiter, async (req, res) => {
             if (row.max_downloads != null && row.download_count >= row.max_downloads) {
                 await invalidatePrezip(pool, SHARE_ZIPS_DIR, 'share', id);
             }
-            res.cookie(dlCookieName, '1', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' || config.secureCookies });
+            res.cookie(dlCookieName, '1', {
+                httpOnly: true,
+                sameSite: 'lax',
+                secure: getSessionCookieOptions(config, 0).secure,
+            });
         } else {
             if (share.max_downloads && share.download_count >= share.max_downloads) {
                 // Optioneel: blokkeer als teller cookie er is maar max is bereikt
@@ -4217,7 +4304,7 @@ apiRouter.all('/reverse/files/:fileId/download', authenticateToken, downloadLimi
 
     // Security: Validate path is within UPLOAD_DIR
     const resolvedPath = path.resolve(file.storage_path);
-    if (!resolvedPath.startsWith(path.resolve(UPLOAD_DIR))) {
+    if (!isResolvedPathInsideDir(UPLOAD_DIR, resolvedPath)) {
         return res.status(500).json({ error: 'File path security violation' });
     }
 
@@ -4354,13 +4441,12 @@ apiRouter.post('/shares/:id/verify', loginLimiter, async (req, res) => {
         const accessToken = jwt.sign(accessPayload, JWT_SECRET, { expiresIn: '1h' }); // 1 uur geldig
 
         const config = await getConfig();
-        const isProduction = process.env.NODE_ENV === 'production';
-        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+        const cookieOpts = getSessionCookieOptions(config, 3600000);
 
         // Zet een HTTP-Only cookie die specifiek is voor deze share
         res.cookie(`share_auth_${id}`, accessToken, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
+            httpOnly: cookieOpts.httpOnly,
+            secure: cookieOpts.secure,
             sameSite: 'lax', // Lax is nodig zodat de cookie wordt meegestuurd bij normale link-navigatie (downloaden)
             maxAge: 3600000 // 1 uur
         });
@@ -4458,8 +4544,13 @@ const shareFileHandler = async (req: any, res: any) => {
             return res.status(410).end();
         }
 
-        // Cookie zetten - Forceer secure in productie
-        res.cookie(cookieName, '1', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
+        // Cookie zetten - Forceer secure wanneer productie of HTTPS app URL
+        const cfg = await getConfig();
+        res.cookie(cookieName, '1', {
+            httpOnly: true,
+            sameSite: 'lax',
+            secure: getSessionCookieOptions(cfg, 0).secure,
+        });
     }
 
     // Stap 3: Bestand sturen (Force zip for shortcuts)
@@ -4476,7 +4567,7 @@ const shareFileHandler = async (req: any, res: any) => {
 
     // Security: Validate path is within UPLOAD_DIR
     const resolvedPath = path.resolve(data.storage_path);
-    if (!resolvedPath.startsWith(path.resolve(UPLOAD_DIR))) {
+    if (!isResolvedPathInsideDir(UPLOAD_DIR, resolvedPath)) {
         return res.status(500).send('File path security violation');
     }
 
@@ -4591,7 +4682,7 @@ apiRouter.post('/ui/staged', authenticateToken, downloadLimiter, async (req: any
         return res.status(403).json({ error: 'Invalid file' });
     }
     const filePath = path.join(TEMP_DIR, tempId);
-    if (!path.resolve(filePath).startsWith(path.resolve(TEMP_DIR))) {
+    if (!isResolvedPathInsideDir(TEMP_DIR, filePath)) {
         return res.status(403).json({ error: 'Invalid path' });
     }
     try {
@@ -4639,7 +4730,7 @@ apiRouter.post('/ui/reverse-file', authenticateToken, downloadLimiter, async (re
         return res.status(400).json({ error: 'Preview not available for this type' });
     }
     const resolvedPath = path.resolve(row.storage_path);
-    if (!resolvedPath.startsWith(path.resolve(UPLOAD_DIR))) {
+    if (!isResolvedPathInsideDir(UPLOAD_DIR, resolvedPath)) {
         return res.status(500).json({ error: 'Invalid path' });
     }
     const dangerousTypes = ['.html', '.htm', '.xhtml', '.svg', '.xml', '.php'];
@@ -4705,12 +4796,11 @@ apiRouter.post('/public/reverse/:id/verify', loginLimiter, async (req, res) => {
         // --- BEVEILIGING START ---
         const token = jwt.sign({ shareId: id, scope: 'upload' }, JWT_SECRET, { expiresIn: '1h' });
         const config = await getConfig();
-        const isProduction = process.env.NODE_ENV === 'production';
-        const forceSecure = config.secureCookies || (config.appUrl && config.appUrl.startsWith('https://'));
+        const cookieOpts = getSessionCookieOptions(config, 3600000);
 
         res.cookie(`rev_auth_${id}`, token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
+            httpOnly: cookieOpts.httpOnly,
+            secure: cookieOpts.secure,
             sameSite: 'strict',
             maxAge: 3600000
         });
@@ -4909,6 +4999,18 @@ apiRouter.post('/public/reverse/:id/chunk', checkUploadLimits, uploadLimiter, ch
         }
 
         await safeUnlink(req.file.path);
+
+        if (maxSize > 0) {
+            try {
+                const partStat = await fs.stat(partFilePath);
+                if (currentDbUsage + partStat.size > maxSize) {
+                    await safeUnlink(partFilePath);
+                    return res.status(413).json({ error: `Share limit exceeded.` });
+                }
+            } catch {
+                /* part may have been removed concurrently */
+            }
+        }
 
         res.json({ success: true, chunkIndex: chunkIdx });
     } catch (e: any) {

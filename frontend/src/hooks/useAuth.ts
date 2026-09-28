@@ -6,19 +6,30 @@ export function useAuth() {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
-        try {
-            const storedUser = localStorage.getItem('user');
-
-            if (storedUser && storedUser !== 'undefined' && storedUser !== 'null') {
-                setUser(JSON.parse(storedUser));
-            } else {
-                localStorage.removeItem('user');
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch(`${API_URL}/users/me`, { credentials: 'include' });
+                if (cancelled) return;
+                if (res.ok) {
+                    const me = await res.json();
+                    setUser(me);
+                    localStorage.setItem('user', JSON.stringify(me));
+                } else {
+                    localStorage.removeItem('user');
+                    setUser(null);
+                }
+            } catch (e) {
+                console.error('Session check failed', e);
+                if (!cancelled) {
+                    localStorage.removeItem('user');
+                    setUser(null);
+                }
+            } finally {
+                if (!cancelled) setLoading(false);
             }
-        } catch (e) {
-            console.error('User parse error', e);
-            localStorage.removeItem('user');
-        }
-        setLoading(false);
+        })();
+        return () => { cancelled = true; };
     }, []);
 
     const login = useCallback((u: any) => {
