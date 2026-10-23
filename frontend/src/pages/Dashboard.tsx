@@ -10,7 +10,6 @@ import { API_URL } from '../api/constants';
 import { isAllowedBrandingUrl } from '../lib';
 import { useAppConfig } from '../context/AppConfigContext';
 import { useUI } from '../context/UIContext';
-import { useAuth } from '../hooks/useAuth';
 import { useTokenExpiration } from '../hooks/useTokenExpiration';
 import { GlobalStyles } from '../components/layout/GlobalStyles';
 import { Footer } from '../components/layout/Footer';
@@ -22,7 +21,7 @@ import { ConfigTabs } from './ConfigTabs';
 import { SetupWizard } from './SetupWizard';
 
 
-export function Dashboard({ token, logout }: any) {
+export function Dashboard({ user, token, logout }: any) {
     const [view, setView] = useState('upload');
     const [uploadShowsSuccess, setUploadShowsSuccess] = useState(false);
     const uploadResetRef = useRef<(() => void) | null>(null);
@@ -30,7 +29,6 @@ export function Dashboard({ token, logout }: any) {
     const [showSetup, setShowSetup] = useState(false);
     const [is2FALocked, setIs2FALocked] = useState(false);
     const [checking2FA, setChecking2FA] = useState(true);
-    const { user } = useAuth();
     const { notify } = useUI();
     // Check of setup nodig is bij laden (geen auto-wizard in demo — voorkomt "quick start" bij elke login)
     useEffect(() => {

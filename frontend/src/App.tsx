@@ -25,7 +25,7 @@ function App() {
                             <Route path="/r/:id" element={<GuestUploadPage />} />
                             <Route path="/login" element={!user ? <LoginPage onLogin={login} /> : <Navigate to="/" />} />
                             <Route path="/reset-password" element={<PasswordResetPage />} />
-                            <Route path="/*" element={user ? <Dashboard token={token} logout={logout} /> : <Navigate to="/login" />} />
+                            <Route path="/*" element={user ? <Dashboard user={user} token={token} logout={logout} /> : <Navigate to="/login" />} />
                         </Routes>
                     </UIProvider>
                 </AppConfigProvider>

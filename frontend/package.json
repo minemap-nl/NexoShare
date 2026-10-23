@@ -14,7 +14,7 @@
     "@simplewebauthn/browser": "^14.0.0",
     "@types/prismjs": "^1.26.6",
     "axios": "^1.20.0",
-    "dompurify": "^3.4.16",
+    "dompurify": "^3.4.17",
     "jszip": "^3.10.2",
     "lucide-react": "^1.48.0",
     "mammoth": "^1.13.0",
@@ -29,10 +29,14 @@
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "overrides": {
-    "@xmldom/xmldom": "^0.8.12",
+    "@xmldom/xmldom": "^0.8.15",
     "underscore": "^1.13.8",
-    "follow-redirects": "^1.16.0",
-    "brace-expansion": "^5.0.9"
+    "follow-redirects": "^1.16.1",
+    "brace-expansion": "^5.0.12",
+    "dompurify": "^3.4.17",
+    "source-map-js": "^1.2.2",
+    "undici": "^8.12.3",
+    "@humanfs/node": "^0.16.8"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

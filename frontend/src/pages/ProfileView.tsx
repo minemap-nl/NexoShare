@@ -65,7 +65,7 @@ function DemoProfileGeneralLock({ locked, children }: { locked: boolean; childre
 }
 
 export function ProfileView({ user, config, forcedSetup = false, onComplete }: { user: any, config: any, forcedSetup?: boolean, onComplete?: () => void }) {
-    const [form, setForm] = useState({ name: user.name, email: user.email, password: '' });
+    const [form, setForm] = useState({ name: user?.name ?? '', email: user?.email ?? '', password: '' });
 
     // Hulpfunctie: Haal hostname uit config.appUrl (bijv. "mijnshare.nl" of "localhost")
     const getDomain = (url: string) => {

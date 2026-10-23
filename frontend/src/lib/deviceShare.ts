@@ -9,6 +9,16 @@ export function isMobileDevice(): boolean {
     return mobileUa || narrowTouch;
 }
 
+/** Only allow http(s) share links into clipboard / Web Share (blocks javascript: etc.). */
+export function isSafeShareUrl(url: string): boolean {
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+    } catch {
+        return false;
+    }
+}
+
 export async function shareOrCopy(opts: {
     text: string;
     url: string;
@@ -16,6 +26,7 @@ export async function shareOrCopy(opts: {
     onCopied: () => void;
 }): Promise<void> {
     const { text, url, title, onCopied } = opts;
+    const safeUrl = isSafeShareUrl(url) ? url : '';
 
     if (isMobileDevice() && typeof navigator.share === 'function') {
         try {
@@ -30,7 +41,7 @@ export async function shareOrCopy(opts: {
         }
     }
 
-    const clip = text.includes(url) ? text : `${text}\n${url}`;
+    const clip = safeUrl && text.includes(safeUrl) ? text : safeUrl ? `${text}\n${safeUrl}` : text;
     await navigator.clipboard.writeText(clip);
     onCopied();
 }
