@@ -35,3 +35,9 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 .cursor/
+
+# Snyk local policy/cache
+.snyk
+**/.snyk
+.dccache
+**/.dccache

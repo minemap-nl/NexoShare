@@ -50,5 +50,8 @@ email-preview.html
 # Release notes live on GitHub Releases, not in the repo
 RELEASE_NOTES.md
 
-# Local Snyk/cli cache (policy file frontend/.snyk is committed)
+# Snyk local policy/cache (do not commit)
+.snyk
+**/.snyk
 .dccache
+**/.dccache

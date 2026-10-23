@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Snyk local policy/cache
+.snyk
+.dccache
