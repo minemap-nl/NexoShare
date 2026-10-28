@@ -22,6 +22,8 @@ import { useAppConfig } from '../context/AppConfigContext';
 import { useUI } from '../context/UIContext';
 import { GlobalStyles } from '../components/layout/GlobalStyles';
 import { Footer } from '../components/layout/Footer';
+import { IosPickerNotice } from '../components/ui/IosPickerNotice';
+import { useIosPickerNotice } from '../hooks/useIosPickerNotice';
 
 
 export function GuestUploadPage() {
@@ -41,6 +43,14 @@ export function GuestUploadPage() {
     const folderInputRef = useRef<HTMLInputElement>(null);
     const filesRef = useRef(files);
     filesRef.current = files;
+    const {
+        isIOS,
+        noticeOpen,
+        intent: iosNoticeIntent,
+        requestAction,
+        confirmNotice,
+        dismissNotice,
+    } = useIosPickerNotice();
 
     useEffect(() => {
         // Fetch met error handling
@@ -266,6 +276,10 @@ export function GuestUploadPage() {
         }
     };
 
+    const openFilePicker = () => fileInputRef.current?.click();
+    const requestFilePick = () => requestAction(openFilePicker, 'pick');
+    const requestSend = () => requestAction(() => { void handleUpload(); }, 'upload');
+
     // Error UI renderen
     if (error) return (
         <div className="min-h-screen bg-app flex items-center justify-center p-4">
@@ -350,7 +364,7 @@ export function GuestUploadPage() {
                             <div className="pointer-events-none absolute inset-0 z-0 rounded-2xl bg-primary-400/[0.06] opacity-0 transition-opacity duration-300 ease-out group-hover:opacity-100" aria-hidden />
                             <div className="pointer-events-none absolute inset-0 z-[1] rounded-2xl border-2 border-dashed border-neutral-800" aria-hidden />
                             <div className="pointer-events-none absolute inset-0 z-[2] rounded-2xl border-2 border-dashed border-primary-400 opacity-0 transition-opacity duration-300 ease-out group-hover:opacity-100" aria-hidden />
-                            <div className="absolute inset-0 z-[3] cursor-pointer" onClick={() => fileInputRef.current?.click()} />
+                            <div className="absolute inset-0 z-[3] cursor-pointer" onClick={requestFilePick} />
 
                             <div className="relative z-10 text-center pointer-events-none mb-4">
                                 <div className="w-16 h-16 bg-gradient-brand-tr rounded-full flex items-center justify-center mx-auto mb-4 shadow-xl transition-transform duration-300 group-hover:scale-[1.03]">
@@ -361,8 +375,8 @@ export function GuestUploadPage() {
                             </div>
 
                             <div className="relative z-20 flex gap-3 mt-0 pb-6 pointer-events-auto">
-                                <button onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 cursor-pointer hover:border-primary-400">Select Files</button>
-                                <button onClick={(e) => { e.stopPropagation(); onPickFolder(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 flex items-center gap-2 cursor-pointer hover:border-primary-400"><FolderIcon className="w-3 h-3" /> Select Folder</button>
+                                <button type="button" onClick={(e) => { e.stopPropagation(); requestFilePick(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 cursor-pointer hover:border-primary-400">Select Files</button>
+                                <button type="button" onClick={(e) => { e.stopPropagation(); onPickFolder(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 flex items-center gap-2 cursor-pointer hover:border-primary-400"><FolderIcon className="w-3 h-3" /> Select Folder</button>
                             </div>
                             {info.maxSize && (
                                 <div className="mt-0 px-3 py-1 rounded-full bg-neutral-800 border border-neutral-700 text-xs text-neutral-400 font-medium group-hover:border-primary-400/30 group-hover:text-primary-200 mb-4 md:mb-0">
@@ -374,10 +388,17 @@ export function GuestUploadPage() {
                         {/* @ts-ignore */}
                         <input ref={fileInputRef} type="file" multiple className="hidden" onChange={e => {
                             if (e.target.files) {
-                                const newFiles = Array.from(e.target.files as FileList).map((f: any) => ({
+                                const list = Array.from(e.target.files as FileList);
+                                const newFiles = list.map((f: any) => ({
                                     file: f, path: f.webkitRelativePath || f.name, name: f.name, id: generateUUID(), isDirectory: false, size: f.size
                                 }));
                                 setFiles(prev => sortFiles(synthesizeDirectoryItems([...prev, ...newFiles])));
+                                if (isIOS && list.length > 0) {
+                                    notify(
+                                        list.length === 1 ? '1 file added' : `${list.length} files added`,
+                                        'success'
+                                    );
+                                }
                                 e.target.value = '';
                             }
                         }} />
@@ -462,12 +483,18 @@ export function GuestUploadPage() {
                             </div>
                         )}
 
-                        <button onClick={handleUpload} disabled={uploading || files.length === 0} className="w-full bg-green-600 hover:bg-green-700 text-white p-3 rounded-lg font-bold disabled:bg-neutral-800 transition btn-press shadow-lg">
+                        <button type="button" onClick={requestSend} disabled={uploading || files.length === 0} className="w-full bg-green-600 hover:bg-green-700 text-white p-3 rounded-lg font-bold disabled:bg-neutral-800 transition btn-press shadow-lg">
                             {finalizing ? "Processing..." : uploading ? `Uploading (${progress}%)...` : `Send ${files.length} files`}
                         </button>
                     </div>
                 )}
             </div>
+            <IosPickerNotice
+                open={noticeOpen}
+                intent={iosNoticeIntent}
+                onConfirm={confirmNotice}
+                onDismiss={dismissNotice}
+            />
             <Footer />
         </div>
     );

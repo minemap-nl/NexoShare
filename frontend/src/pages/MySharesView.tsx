@@ -54,6 +54,8 @@ import { ShareButton } from '../components/ui/ShareButton';
 import { Checkbox } from '../components/ui/Checkbox';
 import { ExtensionSelector } from '../components/ui/ExtensionSelector';
 import { Tooltip } from '../components/ui/Tooltip';
+import { IosPickerNotice } from '../components/ui/IosPickerNotice';
+import { useIosPickerNotice } from '../hooks/useIosPickerNotice';
 
 
 export function MySharesView({ active }: { active: boolean }) {
@@ -67,6 +69,14 @@ export function MySharesView({ active }: { active: boolean }) {
     const fileInputRef = useRef<HTMLInputElement>(null);
     const { notify, confirm, preview, isConfirming, isPreviewing } = useUI();
     const { config: msCfg } = useAppConfig();
+    const {
+        noticeOpen,
+        intent: iosNoticeIntent,
+        requestAction,
+        confirmNotice,
+        dismissNotice,
+    } = useIosPickerNotice();
+    const requestFilePick = () => requestAction(() => fileInputRef.current?.click(), 'pick');
 
     // Esc keys
     useEscapeKey(() => setEditing(null), !!editing && !isConfirming && !isPreviewing);
@@ -671,7 +681,7 @@ export function MySharesView({ active }: { active: boolean }) {
                                     )}
 
                                     <div className="mt-4 flex gap-2">
-                                        <button onClick={() => fileInputRef.current?.click()} className="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition border border-neutral-700 flex items-center gap-2">
+                                        <button type="button" onClick={requestFilePick} className="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition border border-neutral-700 flex items-center gap-2">
                                             <Plus className="w-4 h-4" /> Add Files
                                         </button>
 
@@ -756,6 +766,13 @@ export function MySharesView({ active }: { active: boolean }) {
                     </ModalPortal>
                 )}
             </AnimatePresence>
+
+            <IosPickerNotice
+                open={noticeOpen}
+                intent={iosNoticeIntent}
+                onConfirm={confirmNotice}
+                onDismiss={dismissNotice}
+            />
         </div>
     );
 };

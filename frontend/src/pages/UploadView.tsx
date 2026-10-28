@@ -53,6 +53,8 @@ import { ShareButton } from '../components/ui/ShareButton';
 import { Checkbox } from '../components/ui/Checkbox';
 import { ExtensionSelector } from '../components/ui/ExtensionSelector';
 import { Tooltip } from '../components/ui/Tooltip';
+import { IosPickerNotice } from '../components/ui/IosPickerNotice';
+import { useIosPickerNotice } from '../hooks/useIosPickerNotice';
 
 
 export type UploadViewProps = {
@@ -84,6 +86,14 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
     const pendingResetOnNextUploadFocusRef = useRef(false);
     const prevActiveRef = useRef(active);
     const { notify, preview, isConfirming, isPreviewing } = useUI();
+    const {
+        isIOS,
+        noticeOpen,
+        intent: iosNoticeIntent,
+        requestAction,
+        confirmNotice,
+        dismissNotice,
+    } = useIosPickerNotice();
 
     // Must not rely on useEffect: if the user switches tabs before effects run, hasSeen would stay false
     // and leaving the Upload tab would never arm pendingReset (Docker / fast navigation).
@@ -213,7 +223,8 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
 
     const handleFileSelect = (e: any) => {
         if (e.target.files) {
-            const newFiles = Array.from(e.target.files as FileList).map((f: any) => ({
+            const list = Array.from(e.target.files as FileList);
+            const newFiles = list.map((f: any) => ({
                 file: f,
                 path: f.webkitRelativePath || f.name,
                 name: f.name,
@@ -227,6 +238,12 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
                 if (!uploading) saveUploadState({ files: updated, options: optionsRef.current, uploading: false });
                 return updated;
             });
+            if (isIOS && list.length > 0 && e.target === fileInputRef.current) {
+                notify(
+                    list.length === 1 ? '1 file added' : `${list.length} files added`,
+                    'success'
+                );
+            }
             e.target.value = '';
         }
     };
@@ -532,6 +549,10 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
         }
     };
 
+    const openFilePicker = () => fileInputRef.current?.click();
+    const requestFilePick = () => requestAction(openFilePicker, 'pick');
+    const requestSend = () => requestAction(() => { void handleUpload(); }, 'upload');
+
     const [qrCode, setQrCode] = useState<string | null>(null);
 
     const reset = useCallback(() => {
@@ -661,7 +682,7 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
                 {/* 1. Invisible Click Overlay for File Upload - Acts as background click */}
                 <div
                     className="absolute inset-0 z-[3] cursor-pointer"
-                    onClick={() => fileInputRef.current?.click()}
+                    onClick={requestFilePick}
                 />
 
                 {/* 2. Hidden Inputs */}
@@ -678,8 +699,8 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
 
                 {/* 4. Buttons - High Z-Index to catch their own clicks */}
                 <div className="relative z-20 flex gap-3 mt-0 pb-6 pointer-events-auto">
-                    <button onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 cursor-pointer hover:border-primary-400">Select Files</button>
-                    <button onClick={(e) => { e.stopPropagation(); onPickFolder(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 flex items-center gap-2 cursor-pointer hover:border-primary-400"><FolderIcon className="w-3 h-3" /> Select Folder</button>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); requestFilePick(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 cursor-pointer hover:border-primary-400">Select Files</button>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); onPickFolder(); }} className="text-xs bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-2 rounded-lg transition border border-neutral-700 flex items-center gap-2 cursor-pointer hover:border-primary-400"><FolderIcon className="w-3 h-3" /> Select Folder</button>
                 </div>
                 {maxLimitLabel && (
                     <div className="mt-0 px-3 py-1 rounded-full bg-neutral-800 border border-neutral-700 text-xs text-neutral-400 font-medium group-hover:border-primary-400/30 group-hover:text-primary-200 mb-4 md:mb-0">
@@ -923,14 +944,21 @@ export function UploadView({ active, onUploadSurfaceChange, registerReset }: Upl
                                 </div>
 
                                 <div className="flex justify-end gap-3 pt-4 border-t border-neutral-800">
-                                    <button onClick={() => setShowSettings(false)} className="text-neutral-400 hover:text-white px-4 py-2 transition">Cancel</button>
-                                    <button onClick={handleUpload} disabled={uploading} className="bg-gradient-brand hover:brightness-90 px-8 py-3 rounded-lg text-white font-bold transition btn-press shadow-lg shadow-primary-950/25">{finalizing ? 'Processing...' : uploading ? 'In progress...' : 'Send'}</button>
+                                    <button type="button" onClick={() => setShowSettings(false)} className="text-neutral-400 hover:text-white px-4 py-2 transition">Cancel</button>
+                                    <button type="button" onClick={requestSend} disabled={uploading} className="bg-gradient-brand hover:brightness-90 px-8 py-3 rounded-lg text-white font-bold transition btn-press shadow-lg shadow-primary-950/25">{finalizing ? 'Processing...' : uploading ? 'In progress...' : 'Send'}</button>
                                 </div>
                             </motion.div>
                         </motion.div>
                     </ModalPortal>
                 )}
             </AnimatePresence>
+
+            <IosPickerNotice
+                open={noticeOpen}
+                intent={iosNoticeIntent}
+                onConfirm={confirmNotice}
+                onDismiss={dismissNotice}
+            />
         </div>
     );
 };

@@ -9,6 +9,14 @@ export function isMobileDevice(): boolean {
     return mobileUa || narrowTouch;
 }
 
+/** iPhone / iPod / iPad, including iPadOS that reports as MacIntel. */
+export function isIOSDevice(): boolean {
+    if (typeof navigator === 'undefined') return false;
+    const ua = navigator.userAgent || '';
+    if (/iP(hone|ad|od)/.test(ua)) return true;
+    return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+}
+
 /** Only allow http(s) share links into clipboard / Web Share (blocks javascript: etc.). */
 export function isSafeShareUrl(url: string): boolean {
     try {
